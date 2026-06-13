@@ -25,6 +25,11 @@ const DIRS = [
 const FETCH_CAP_M = 3000;
 // Fraction of the wind's head/tailwind component added to boat speed.
 const WIND_SPEED_FACTOR = 0.07;
+// How strongly to discourage reusing an already-travelled corridor, and how
+// many cells wide that corridor is. Soft (cost multiplier), so a route is
+// still found when there is genuinely no alternative water.
+const AVOID_PENALTY = 6;
+const AVOID_RADIUS = 2;
 
 /** Unit vector (grid coords, y down) for a compass bearing in degrees. */
 function bearingVec(deg) {
@@ -205,7 +210,7 @@ export function dijkstra(params, startIdx, opts = {}) {
       const dist = cellMeters * len;
       const dt = dist / speeds[d];
       let penalty = 1 + 0.1 * over * (Math.min(fetchF[j], FETCH_CAP_M) / FETCH_CAP_M);
-      if (opts.avoid && opts.avoid[j]) penalty *= 2.5;
+      if (opts.avoid && opts.avoid[j]) penalty *= AVOID_PENALTY;
       const c = cost[i] + dt * penalty;
       if (c < cost[j]) {
         cost[j] = c;
@@ -222,6 +227,23 @@ function tracePath(parent, from) {
   const path = [];
   for (let i = from; i !== -1; i = parent[i]) path.push(i);
   return path.reverse();
+}
+
+/** Mark a path plus a `radius`-cell band around it into the `avoid` mask. */
+function dilateInto(avoid, W, H, path, radius) {
+  let frontier = [];
+  for (const i of path) if (!avoid[i]) { avoid[i] = 1; frontier.push(i); }
+  for (let r = 0; r < radius; r++) {
+    const next = [];
+    for (const i of frontier) {
+      const x = i % W, y = (i / W) | 0;
+      if (x > 0 && !avoid[i - 1]) { avoid[i - 1] = 1; next.push(i - 1); }
+      if (x < W - 1 && !avoid[i + 1]) { avoid[i + 1] = 1; next.push(i + 1); }
+      if (y > 0 && !avoid[i - W]) { avoid[i - W] = 1; next.push(i - W); }
+      if (y < H - 1 && !avoid[i + W]) { avoid[i + W] = 1; next.push(i + W); }
+    }
+    frontier = next;
+  }
 }
 
 function pathDistM(W, cellMeters, path) {
@@ -257,15 +279,8 @@ export function planViaRoute(params, startIdx, stopIdxs) {
     legs.push(path);
     legTimesS.push(d.time[to] - tAcc);
     totalDistM += pathDistM(W, cellMeters, path);
-    for (const i of path) {
-      maxFetchM = Math.max(maxFetchM, fetchFields[bucketOf(timeline, d.time[i])][i]);
-      avoid[i] = 1;
-      const x = i % W, y = (i / W) | 0;
-      if (x > 0) avoid[i - 1] = 1;
-      if (x < W - 1) avoid[i + 1] = 1;
-      if (y > 0) avoid[i - W] = 1;
-      if (y < H - 1) avoid[i + W] = 1;
-    }
+    for (const i of path) maxFetchM = Math.max(maxFetchM, fetchFields[bucketOf(timeline, d.time[i])][i]);
+    dilateInto(avoid, W, H, path, AVOID_RADIUS);
     tAcc = d.time[to];
   }
   return { legs, legTimesS, totalTimeS: tAcc, totalDistM, maxFetchM };
@@ -335,14 +350,7 @@ export function planRoundTrip(params, startIdx, budgetSec) {
     const outPath = tracePath(out.parent, turnIdx);
     // Discourage (not forbid) reusing the outbound corridor on the way home
     const avoid = new Uint8Array(mask.length);
-    for (const i of outPath) {
-      avoid[i] = 1;
-      const x = i % W, y = (i / W) | 0;
-      if (x > 0) avoid[i - 1] = 1;
-      if (x < W - 1) avoid[i + 1] = 1;
-      if (y > 0) avoid[i - W] = 1;
-      if (y < H - 1) avoid[i + W] = 1;
-    }
+    dilateInto(avoid, W, H, outPath, AVOID_RADIUS);
     avoid[startIdx] = 0;
     const back = dijkstra(params, turnIdx,
       { avoid, target: startIdx, startTime: out.time[turnIdx] });
