@@ -160,15 +160,20 @@ footer a { color: #7cc4e8; }
     /* Above the map container and Leaflet's controls (z-index up to ~1000) */
     z-index: 1200;
     width: auto; flex: none; max-height: 62vh;
-    padding: 18px 16px calc(16px + env(safe-area-inset-bottom));
+    padding: 0 16px calc(16px + env(safe-area-inset-bottom));
     border-top-left-radius: 16px; border-top-right-radius: 16px;
     box-shadow: 0 -6px 24px rgba(0, 0, 0, 0.45);
     transition: transform 0.25s ease;
     -webkit-overflow-scrolling: touch;
   }
-  #panelToggle { display: flex; position: relative; }
+  /* Toggle stays pinned at the top of the sheet while its content scrolls */
+  #panelToggle {
+    display: flex; position: sticky; top: 0; z-index: 5;
+    margin: 0 -16px 6px; padding: 14px 16px 10px;
+    background: #15212b; border-bottom: 1px solid #24323e;
+  }
   /* Collapsed: slide the sheet down, leaving just the toggle bar peeking */
-  body.panel-collapsed #panel { transform: translateY(calc(100% - 46px)); }
+  body.panel-collapsed #panel { transform: translateY(calc(100% - 48px)); }
   /* Wider tap target for sliders on touch */
   #panel input[type="range"] { height: 28px; }
 }

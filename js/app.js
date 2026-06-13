@@ -37,6 +37,16 @@ $('panelToggle').addEventListener('click', () =>
   setCollapsed(!document.body.classList.contains('panel-collapsed')));
 window.addEventListener('resize', () => map.invalidateSize());
 
+// On a phone, after a route is generated, open the sheet and scroll the
+// route summary into view so it doesn't hide below the fold.
+function revealRoute() {
+  if (!isMobile()) return;
+  setCollapsed(false);
+  const panel = $('panel'), stats = $('stats');
+  requestAnimationFrame(() =>
+    panel.scrollTo({ top: Math.max(0, stats.offsetTop - 56), behavior: 'smooth' }));
+}
+
 let putIn = null;        // L.LatLng
 let putInMarker = null;
 let stops = [];          // [{latlng, marker}]
@@ -567,6 +577,7 @@ async function generate() {
       'Difficulty: ' + difficultyBadge(totalDistKm, wsMax, maxFetchM, marine?.waterTempC);
     $('stats').classList.remove('hidden');
     $('nav').classList.remove('hidden');
+    revealRoute();
 
     lastResult = {
       legsLatLngs, lunch, totalTimeS, totalDistKm, departMs,
