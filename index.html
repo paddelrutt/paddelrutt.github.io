@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PaddlePlanner — wind-aware kayak round trips</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <aside id="panel">
+    <h1>PaddlePlanner <span class="tag">spike</span></h1>
+    <p class="hint">First click sets your put-in. More clicks add <b>stops</b> the
+    route must visit in order — leave none for an automatic round trip.</p>
+
+    <div class="stopsrow">
+      <span id="stopsLabel">No stops</span>
+      <button id="undoStop" class="mini" disabled>Undo stop</button>
+      <button id="clearAll" class="mini" disabled>Clear all</button>
+    </div>
+
+    <label>Trip duration: <output id="durationOut">3.0 h</output>
+      <input type="range" id="duration" min="1" max="8" step="0.5" value="3" />
+    </label>
+
+    <label>Paddling speed: <output id="speedOut">5.0 km/h</output>
+      <input type="range" id="speed" min="3" max="7" step="0.5" value="5" />
+    </label>
+
+    <label>Wind comfort limit: <output id="comfortOut">6 m/s</output>
+      <input type="range" id="comfort" min="3" max="12" step="1" value="6" />
+    </label>
+
+    <label>Max distance from shore: <output id="shoreOut">no limit</output>
+      <input type="range" id="shore" min="100" max="2100" step="100" value="2100" />
+    </label>
+
+    <label>Max water depth (sea): <output id="depthOut">no limit</output>
+      <input type="range" id="depth" min="2" max="52" step="2" value="52" />
+    </label>
+
+    <label class="check">
+      <input type="checkbox" id="showMask" /> Show water grid overlay
+    </label>
+
+    <button id="generate" disabled>Generate round trip</button>
+
+    <div id="status"></div>
+
+    <div id="wind" class="card hidden">
+      <h2>Conditions at put-in</h2>
+      <div class="windrow">
+        <span id="windArrow" class="arrow">&#10148;</span>
+        <span id="windText"></span>
+      </div>
+      <div id="windExtra"></div>
+    </div>
+
+    <div id="stats" class="card hidden">
+      <h2>Route</h2>
+      <div id="statsBody"></div>
+      <button id="gpxBtn" class="secondary">Download GPX</button>
+    </div>
+
+    <div id="nav" class="card hidden">
+      <h2>Navigation</h2>
+      <button id="navBtn" class="secondary">Start GPS navigation</button>
+      <label class="check"><input type="checkbox" id="follow" checked /> Follow my position</label>
+      <div id="navBody"></div>
+    </div>
+
+    <footer>
+      Data: &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors ·
+      tiles <a href="https://openfreemap.org">OpenFreeMap</a> ·
+      weather <a href="https://opendata.smhi.se">SMHI</a>
+    </footer>
+  </aside>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

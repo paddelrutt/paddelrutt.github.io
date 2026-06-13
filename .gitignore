@@ -1,0 +1,5 @@
+node_modules/
+test/e2e-result.png
+*.tiff
+headers.txt
+.DS_Store
