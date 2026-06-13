@@ -64,19 +64,68 @@ function updateStopsUI() {
     ? 'Generate round trip' : `Generate tour via ${stops.length} stop${stops.length > 1 ? 's' : ''}`;
 }
 
+function makeStopIcon(n) {
+  return L.divIcon({
+    className: '', html: `<div class="stop-icon">${n}</div>`,
+    iconSize: [20, 20], iconAnchor: [10, 10],
+  });
+}
+
+// Re-label stop markers after add/remove so numbers stay 1..N in order.
+function renumberStops() {
+  stops.forEach((s, i) => s.marker.setIcon(makeStopIcon(i + 1)));
+  updateStopsUI();
+}
+
+function removeStop(stopObj) {
+  const idx = stops.indexOf(stopObj);
+  if (idx === -1) return;
+  stopObj.marker.remove();
+  stops.splice(idx, 1);
+  renumberStops();
+  setStatus(stops.length ? 'Stop removed — regenerate to replan.' : 'All stops removed.');
+}
+
+// Popup with a remove button; rebuilt on open so it always targets this stop.
+function stopPopup(stopObj) {
+  const div = document.createElement('div');
+  div.className = 'marker-popup';
+  div.innerHTML = `<div class="mp-title">Stop ${stops.indexOf(stopObj) + 1}</div>`;
+  const btn = document.createElement('button');
+  btn.className = 'popup-remove';
+  btn.textContent = '✕ Remove stop';
+  btn.addEventListener('click', () => { map.closePopup(); removeStop(stopObj); });
+  div.appendChild(btn);
+  return div;
+}
+
+function addStop(latlng) {
+  const stopObj = { latlng, marker: null };
+  const marker = L.marker(latlng, { icon: makeStopIcon(stops.length + 1), draggable: true });
+  stopObj.marker = marker;
+  marker.bindPopup(() => stopPopup(stopObj));
+  marker.on('dragend', () => {
+    stopObj.latlng = marker.getLatLng();
+    setStatus('Stop moved — regenerate to replan.');
+  });
+  marker.addTo(map);
+  stops.push(stopObj);
+}
+
 map.on('click', (e) => {
   if (!putIn) {
     putIn = e.latlng;
-    putInMarker = L.marker(putIn).addTo(map).bindPopup('Put-in').openPopup();
+    putInMarker = L.marker(putIn, { draggable: true })
+      .addTo(map).bindPopup('Put-in — drag to move').openPopup();
+    putInMarker.on('dragend', () => {
+      putIn = putInMarker.getLatLng();
+      setStatus('Put-in moved — regenerate to replan.');
+    });
     generateBtn.disabled = false;
-    setStatus('Put-in set. Click again to add stops, or generate.');
+    setStatus('Put-in set. Click to add stops; drag any marker to move, tap a stop to remove.');
   } else {
-    const n = stops.length + 1;
-    const marker = L.marker(e.latlng, {
-      icon: L.divIcon({ className: '', html: `<div class="stop-icon">${n}</div>`, iconSize: [20, 20], iconAnchor: [10, 10] }),
-    }).addTo(map).bindPopup(`Stop ${n}`);
-    stops.push({ latlng: e.latlng, marker });
-    setStatus(`Stop ${n} added.`);
+    addStop(e.latlng);
+    setStatus(`Stop ${stops.length} added.`);
   }
   updateStopsUI();
 });
@@ -84,7 +133,7 @@ map.on('click', (e) => {
 $('undoStop').addEventListener('click', () => {
   const s = stops.pop();
   if (s) s.marker.remove();
-  updateStopsUI();
+  renumberStops();
 });
 
 $('clearAll').addEventListener('click', () => {
@@ -544,4 +593,10 @@ generateBtn.addEventListener('click', generate);
 setStatus('Click the map to set your put-in point.');
 
 // Test hook for automated e2e verification
-window.__paddle = { map, generate };
+window.__paddle = {
+  map, generate,
+  getState: () => ({
+    putIn: putIn ? { lat: putIn.lat, lng: putIn.lng } : null,
+    stops: stops.map((s) => ({ lat: s.latlng.lat, lng: s.latlng.lng })),
+  }),
+};

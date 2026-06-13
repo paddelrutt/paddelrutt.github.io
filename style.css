@@ -48,6 +48,12 @@ button.mini:disabled { background: #3a4a56; color: #8395a1; cursor: default; }
   box-shadow: 0 1px 3px rgba(0,0,0,0.4);
 }
 
+.marker-popup .mp-title { font-weight: 600; margin-bottom: 6px; }
+.popup-remove {
+  background: #c1554d; color: #fff; border: 0; border-radius: 4px;
+  padding: 5px 10px; font-size: 13px; cursor: pointer;
+}
+
 button.secondary {
   width: 100%; margin-top: 10px; padding: 8px; font-size: 13px; font-weight: 600;
   background: #2a6f97; color: white; border: 0; border-radius: 6px; cursor: pointer;
