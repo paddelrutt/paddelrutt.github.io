@@ -19,6 +19,18 @@ const $ = (id) => document.getElementById(id);
 const statusEl = $('status');
 const generateBtn = $('generate');
 
+// Mobile bottom-sheet: start collapsed so the map is visible, toggle on tap.
+const isMobile = () => window.matchMedia('(max-width: 768px)').matches;
+function setCollapsed(on) {
+  document.body.classList.toggle('panel-collapsed', on);
+  $('panelToggleLabel').textContent = on ? 'Settings & route ▲' : 'Settings & route ▼';
+}
+if (isMobile()) setCollapsed(true);
+$('panelToggle').addEventListener('click', () =>
+  setCollapsed(!document.body.classList.contains('panel-collapsed')));
+// Keep Leaflet's canvas correct when the viewport rotates/resizes.
+window.addEventListener('resize', () => map.invalidateSize());
+
 let putIn = null; // L.LatLng
 let putInMarker = null;
 let stops = []; // [{latlng, marker}]
