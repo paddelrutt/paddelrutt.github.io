@@ -1,0 +1,15 @@
+{
+  "name": "PaddlePlanner — wind-aware kayak routes",
+  "short_name": "PaddlePlanner",
+  "description": "Plan wind-aware kayak round trips and tours, then navigate them — works offline once a route is cached.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#15212b",
+  "theme_color": "#15212b",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

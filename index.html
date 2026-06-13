@@ -2,8 +2,15 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>PaddlePlanner — wind-aware kayak round trips</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>PaddlePlanner — wind-aware kayak routes</title>
+  <meta name="theme-color" content="#15212b" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <link rel="icon" href="icon-192.png" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -13,17 +20,34 @@
       <span class="grip"></span>
       <span id="panelToggleLabel">Settings &amp; route</span>
     </button>
-    <h1>PaddlePlanner <span class="tag">spike</span></h1>
+
+    <div class="titlerow">
+      <h1>PaddlePlanner <span class="tag">spike</span></h1>
+      <button id="installBtn" class="mini" hidden>Install</button>
+    </div>
     <p class="hint">First click sets your put-in. More clicks add <b>stops</b> the
     route must visit in order — leave none for an automatic round trip.
     Drag any marker to move it; tap a stop to remove it.</p>
 
     <div class="stopsrow">
       <span id="stopsLabel">No stops</span>
-      <button id="undoStop" class="mini" disabled>Undo stop</button>
+      <button id="shareBtn" class="mini" disabled>Copy link</button>
+      <button id="undoStop" class="mini" disabled>Undo</button>
       <button id="clearAll" class="mini" disabled>Clear all</button>
     </div>
+    <ol id="stopsList"></ol>
 
+    <label class="fileimport">Import a GPX route
+      <input type="file" id="gpxIn" accept=".gpx,application/gpx+xml" />
+    </label>
+
+    <div class="section">When to go</div>
+    <label>Start in: <output id="departOut">now</output>
+      <input type="range" id="depart" min="0" max="10" step="1" value="0" />
+    </label>
+    <div id="windTimeline" class="windtl"></div>
+
+    <div class="section">Trip settings</div>
     <label>Trip duration: <output id="durationOut">3.0 h</output>
       <input type="range" id="duration" min="1" max="8" step="0.5" value="3" />
     </label>
@@ -45,6 +69,9 @@
     </label>
 
     <label class="check">
+      <input type="checkbox" id="showRest" /> Show shelters, campsites &amp; water
+    </label>
+    <label class="check">
       <input type="checkbox" id="showMask" /> Show water grid overlay
     </label>
 
@@ -53,31 +80,39 @@
     <div id="status"></div>
 
     <div id="wind" class="card hidden">
-      <h2>Conditions at put-in</h2>
+      <h2>Conditions</h2>
       <div class="windrow">
         <span id="windArrow" class="arrow">&#10148;</span>
         <span id="windText"></span>
       </div>
       <div id="windExtra"></div>
+      <div id="safety"></div>
+      <div id="difficulty"></div>
     </div>
 
     <div id="stats" class="card hidden">
       <h2>Route</h2>
       <div id="statsBody"></div>
       <button id="gpxBtn" class="secondary">Download GPX</button>
+      <button id="floatPlanBtn" class="secondary">Share float plan</button>
     </div>
 
     <div id="nav" class="card hidden">
       <h2>Navigation</h2>
       <button id="navBtn" class="secondary">Start GPS navigation</button>
       <label class="check"><input type="checkbox" id="follow" checked /> Follow my position</label>
+      <label class="check"><input type="checkbox" id="voice" /> Voice cues</label>
+      <label class="check"><input type="checkbox" id="compass" /> Compass heading</label>
       <div id="navBody"></div>
     </div>
 
+    <div id="offlineNote"></div>
+
     <footer>
-      Data: &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors ·
+      Data: &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> ·
       tiles <a href="https://openfreemap.org">OpenFreeMap</a> ·
-      weather <a href="https://opendata.smhi.se">SMHI</a>
+      wind <a href="https://opendata.smhi.se">SMHI</a> ·
+      sea <a href="https://emodnet.ec.europa.eu">EMODnet</a>/<a href="https://open-meteo.com">Open-Meteo</a>
     </footer>
   </aside>
   <div id="map"></div>

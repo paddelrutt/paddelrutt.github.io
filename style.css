@@ -33,8 +33,8 @@ body { display: flex; }
 #statsBody { font-size: 13px; line-height: 1.6; }
 #statsBody .warn { color: #f08080; }
 
-.stopsrow { display: flex; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; }
-.stopsrow #stopsLabel { flex: 1; color: #9fb3c0; }
+.stopsrow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; }
+.stopsrow #stopsLabel { flex: 1 0 auto; color: #9fb3c0; }
 button.mini {
   padding: 4px 8px; font-size: 11px; background: #2a6f97; color: white;
   border: 0; border-radius: 4px; cursor: pointer;
@@ -64,6 +64,76 @@ button.secondary.active { background: #c1554d; }
 
 footer { margin-top: 20px; font-size: 11px; color: #6c7f8d; }
 footer a { color: #7cc4e8; }
+
+.titlerow { display: flex; align-items: center; gap: 8px; }
+.titlerow h1 { flex: 1; }
+
+.section {
+  margin: 18px 0 2px; font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.6px; color: #6c8499; border-top: 1px solid #24323e; padding-top: 12px;
+}
+
+#stopsList { list-style: none; margin: 6px 0 0; padding: 0; }
+#stopsList li {
+  display: flex; align-items: center; gap: 6px; font-size: 12px;
+  padding: 4px 0; border-bottom: 1px solid #1d2d3a;
+}
+#stopsList .si-num {
+  flex: 0 0 18px; height: 18px; border-radius: 50%; background: #f4a261; color: #15212b;
+  font-weight: 700; font-size: 11px; display: flex; align-items: center; justify-content: center;
+}
+#stopsList .si-label { flex: 1; color: #9fb3c0; }
+#stopsList .si-btn {
+  background: #24323e; color: #cfe0ec; border: 0; border-radius: 4px;
+  width: 22px; height: 22px; font-size: 12px; cursor: pointer; line-height: 1;
+}
+#stopsList .si-btn:disabled { opacity: 0.35; cursor: default; }
+#stopsList .si-btn.del { background: #c1554d; color: #fff; }
+
+.fileimport {
+  display: block; margin-top: 10px; font-size: 12px; color: #9fb3c0;
+}
+.fileimport input { display: block; margin-top: 4px; font-size: 11px; color: #9fb3c0; }
+
+.windtl { display: flex; gap: 2px; margin-top: 8px; }
+.windtl .h {
+  flex: 1; text-align: center; font-size: 9px; color: #9fb3c0; cursor: pointer;
+  border-radius: 4px; padding: 3px 0; line-height: 1.3;
+}
+.windtl .h.sel { background: #2a6f97; color: #fff; }
+.windtl .h .wsv { font-weight: 700; font-size: 11px; display: block; color: #dfe9f0; }
+.windtl .h.windy .wsv { color: #f0a080; }
+.windtl .h .dir { display: inline-block; }
+
+#safety { font-size: 12px; color: #9fb3c0; margin-top: 8px; line-height: 1.6; }
+#safety .cold { color: #f08080; font-weight: 600; }
+#difficulty { margin-top: 8px; }
+.diffbadge {
+  display: inline-block; padding: 3px 10px; border-radius: 12px;
+  font-size: 12px; font-weight: 700; color: #15212b;
+}
+.diff-easy { background: #90be6d; }
+.diff-mod { background: #f9c74f; }
+.diff-hard { background: #f08a5d; }
+.diff-extreme { background: #e5575f; color: #fff; }
+
+.btnrow { display: flex; gap: 8px; }
+.btnrow .secondary { flex: 1; }
+
+#offlineNote { font-size: 11px; color: #6c8499; margin-top: 12px; min-height: 14px; }
+#offlineNote.offline { color: #f4d58d; }
+
+.rest-icon {
+  font-size: 15px; text-align: center; line-height: 20px;
+  filter: drop-shadow(0 1px 1px rgba(0,0,0,0.5));
+}
+
+.compass {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 44px; height: 44px; border-radius: 50%; border: 2px solid #2a6f97;
+  margin: 4px 0;
+}
+.compass .needle { font-size: 22px; color: #7cc4e8; transition: transform 0.2s; }
 
 #map { flex: 1; height: 100%; }
 

@@ -4,13 +4,20 @@ import {
 } from './grid.js';
 import { fetchWaterFeatures } from './tiles.js';
 import { computeFetch, computeShoreDistance, planRoundTrip, planViaRoute, smoothPath } from './router.js';
-import { fetchForecast } from './smhi.js';
-import { fetchLandingSpots } from './overpass.js';
+import { fetchForecastSeries, sliceTimeline } from './smhi.js';
+import { fetchLandingSpots, fetchRestPOIs } from './overpass.js';
 import { fetchDepthPerCell } from './depth.js';
+import { fetchMarine } from './marine.js';
+import { sunTimes } from './sun.js';
+
+// Register the service worker for offline support (no-op on http without SW).
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
 
 // Default view: Sankt Anna archipelago, a classic Swedish paddling area
 const map = L.map('map').setView([58.37, 16.78], 11);
-L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+const baseTiles = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19,
   attribution: '&copy; OpenStreetMap contributors',
 }).addTo(map);
@@ -28,21 +35,23 @@ function setCollapsed(on) {
 if (isMobile()) setCollapsed(true);
 $('panelToggle').addEventListener('click', () =>
   setCollapsed(!document.body.classList.contains('panel-collapsed')));
-// Keep Leaflet's canvas correct when the viewport rotates/resizes.
 window.addEventListener('resize', () => map.invalidateSize());
 
-let putIn = null; // L.LatLng
+let putIn = null;        // L.LatLng
 let putInMarker = null;
-let stops = []; // [{latlng, marker}]
+let stops = [];          // [{latlng, marker}]
 let routeLayers = [];
 let maskOverlay = null;
 let spotLayer = null;
-let lastMaskCanvas = null; // {canvas, bounds}
-let lastResult = null; // {legsLatLngs: [[lat,lon]...][], lunch, stops, totalTimeS}
+let restLayer = null;
+let lastMaskCanvas = null;
+let lastResult = null;   // see generate()
+let windSeries = null;   // cached SMHI series for the current put-in
 
 function setStatus(msg) { statusEl.textContent = msg; }
+const havM = (a, b) => map.distance(a, b);
 
-// Slider readouts
+// --- sliders ---------------------------------------------------------------
 const bind = (id, outId, fmt) => {
   const el = $(id), out = $(outId);
   const update = () => (out.textContent = fmt(parseFloat(el.value)));
@@ -55,15 +64,7 @@ bind('comfort', 'comfortOut', (v) => v.toFixed(0) + ' m/s');
 bind('shore', 'shoreOut', (v) => (v > 2000 ? 'no limit' : v.toFixed(0) + ' m'));
 bind('depth', 'depthOut', (v) => (v > 50 ? 'no limit' : v.toFixed(0) + ' m'));
 
-function updateStopsUI() {
-  $('stopsLabel').textContent = stops.length === 0
-    ? 'No stops' : `${stops.length} stop${stops.length > 1 ? 's' : ''}`;
-  $('undoStop').disabled = stops.length === 0;
-  $('clearAll').disabled = !putIn;
-  generateBtn.textContent = stops.length === 0
-    ? 'Generate round trip' : `Generate tour via ${stops.length} stop${stops.length > 1 ? 's' : ''}`;
-}
-
+// --- stops: markers + list -------------------------------------------------
 function makeStopIcon(n) {
   return L.divIcon({
     className: '', html: `<div class="stop-icon">${n}</div>`,
@@ -71,10 +72,54 @@ function makeStopIcon(n) {
   });
 }
 
-// Re-label stop markers after add/remove so numbers stay 1..N in order.
+function updateStopsUI() {
+  $('stopsLabel').textContent = stops.length === 0
+    ? 'No stops' : `${stops.length} stop${stops.length > 1 ? 's' : ''}`;
+  $('undoStop').disabled = stops.length === 0;
+  $('clearAll').disabled = !putIn;
+  $('shareBtn').disabled = !putIn;
+  generateBtn.textContent = stops.length === 0
+    ? 'Generate round trip' : `Generate tour via ${stops.length} stop${stops.length > 1 ? 's' : ''}`;
+  renderStopsList();
+}
+
+function renderStopsList() {
+  const ol = $('stopsList');
+  ol.innerHTML = '';
+  stops.forEach((s, i) => {
+    const li = document.createElement('li');
+    const num = document.createElement('span');
+    num.className = 'si-num'; num.textContent = i + 1;
+    const label = document.createElement('span');
+    label.className = 'si-label';
+    label.textContent = `${s.latlng.lat.toFixed(4)}, ${s.latlng.lng.toFixed(4)}`;
+    const up = document.createElement('button');
+    up.className = 'si-btn'; up.textContent = '▲'; up.title = 'Move earlier';
+    up.disabled = i === 0;
+    up.addEventListener('click', () => moveStop(i, -1));
+    const down = document.createElement('button');
+    down.className = 'si-btn'; down.textContent = '▼'; down.title = 'Move later';
+    down.disabled = i === stops.length - 1;
+    down.addEventListener('click', () => moveStop(i, +1));
+    const del = document.createElement('button');
+    del.className = 'si-btn del'; del.textContent = '✕'; del.title = 'Remove';
+    del.addEventListener('click', () => removeStop(stops[i]));
+    li.append(num, label, up, down, del);
+    ol.appendChild(li);
+  });
+}
+
 function renumberStops() {
   stops.forEach((s, i) => s.marker.setIcon(makeStopIcon(i + 1)));
   updateStopsUI();
+}
+
+function moveStop(i, dir) {
+  const j = i + dir;
+  if (j < 0 || j >= stops.length) return;
+  [stops[i], stops[j]] = [stops[j], stops[i]];
+  renumberStops();
+  setStatus('Stop order changed — regenerate to replan.');
 }
 
 function removeStop(stopObj) {
@@ -86,7 +131,6 @@ function removeStop(stopObj) {
   setStatus(stops.length ? 'Stop removed — regenerate to replan.' : 'All stops removed.');
 }
 
-// Popup with a remove button; rebuilt on open so it always targets this stop.
 function stopPopup(stopObj) {
   const div = document.createElement('div');
   div.className = 'marker-popup';
@@ -99,29 +143,39 @@ function stopPopup(stopObj) {
   return div;
 }
 
-function addStop(latlng) {
-  const stopObj = { latlng, marker: null };
-  const marker = L.marker(latlng, { icon: makeStopIcon(stops.length + 1), draggable: true });
+function addStop(latlng, silent) {
+  const stopObj = { latlng: L.latLng(latlng), marker: null };
+  const marker = L.marker(stopObj.latlng, { icon: makeStopIcon(stops.length + 1), draggable: true });
   stopObj.marker = marker;
   marker.bindPopup(() => stopPopup(stopObj));
   marker.on('dragend', () => {
     stopObj.latlng = marker.getLatLng();
+    renderStopsList();
     setStatus('Stop moved — regenerate to replan.');
   });
   marker.addTo(map);
   stops.push(stopObj);
+  if (!silent) updateStopsUI();
+}
+
+function setPutIn(latlng, silent) {
+  putIn = L.latLng(latlng);
+  if (putInMarker) putInMarker.remove();
+  putInMarker = L.marker(putIn, { draggable: true })
+    .addTo(map).bindPopup('Put-in — drag to move');
+  putInMarker.on('dragend', () => {
+    putIn = putInMarker.getLatLng();
+    windSeries = null; // forecast depends on location
+    refreshWindPreview();
+    setStatus('Put-in moved — regenerate to replan.');
+  });
+  generateBtn.disabled = false;
+  if (!silent) { windSeries = null; refreshWindPreview(); }
 }
 
 map.on('click', (e) => {
   if (!putIn) {
-    putIn = e.latlng;
-    putInMarker = L.marker(putIn, { draggable: true })
-      .addTo(map).bindPopup('Put-in — drag to move').openPopup();
-    putInMarker.on('dragend', () => {
-      putIn = putInMarker.getLatLng();
-      setStatus('Put-in moved — regenerate to replan.');
-    });
-    generateBtn.disabled = false;
+    setPutIn(e.latlng);
     setStatus('Put-in set. Click to add stops; drag any marker to move, tap a stop to remove.');
   } else {
     addStop(e.latlng);
@@ -141,10 +195,12 @@ $('clearAll').addEventListener('click', () => {
   stops = [];
   if (putInMarker) { putInMarker.remove(); putInMarker = null; }
   putIn = null;
+  windSeries = null;
   generateBtn.disabled = true;
   stopNav();
   clearRoute();
   updateStopsUI();
+  $('wind').classList.add('hidden');
   setStatus('Click the map to set your put-in point.');
 });
 
@@ -154,6 +210,8 @@ $('showMask').addEventListener('change', (e) => {
     maskOverlay = L.imageOverlay(lastMaskCanvas.canvas.toDataURL(), lastMaskCanvas.bounds, { opacity: 0.45 }).addTo(map);
   }
 });
+
+$('showRest').addEventListener('change', () => updateRestLayer());
 
 function clearRoute() {
   for (const l of routeLayers) l.remove();
@@ -187,8 +245,86 @@ function renderMaskOverlay(grid, mask, reach) {
   }
 }
 
-const havM = (a, b) => map.distance(a, b); // Leaflet haversine, meters
+// --- "When to go": wind preview timeline -----------------------------------
+async function refreshWindPreview() {
+  const tl = $('windTimeline');
+  if (!putIn) { tl.innerHTML = ''; return; }
+  tl.innerHTML = '<span class="h">loading…</span>';
+  try {
+    if (!windSeries) windSeries = await fetchForecastSeries(putIn.lat, putIn.lng);
+    renderWindTimeline();
+  } catch {
+    tl.innerHTML = '<span class="h">forecast unavailable</span>';
+  }
+}
 
+function renderWindTimeline() {
+  const tl = $('windTimeline');
+  const comfort = parseFloat($('comfort').value);
+  const sel = parseInt($('depart').value, 10);
+  const now = Date.now();
+  const hours = 11;
+  tl.innerHTML = '';
+  for (let h = 0; h <= hours; h++) {
+    const e = sliceTimeline(windSeries, now + h * 3600 * 1000, 1)[0];
+    const div = document.createElement('div');
+    div.className = 'h' + (e.ws > comfort ? ' windy' : '') + (h === sel ? ' sel' : '');
+    const hh = new Date(now + h * 3600 * 1000).getHours();
+    div.innerHTML =
+      `${h === 0 ? 'now' : hh + ':00'}` +
+      `<span class="wsv">${e.ws.toFixed(0)}</span>` +
+      `<span class="dir" style="transform:rotate(${e.wdDeg + 180}deg)">↑</span>`;
+    div.title = `${e.ws.toFixed(1)} m/s from ${Math.round(e.wdDeg)}° at ${h === 0 ? 'now' : hh + ':00'}`;
+    div.addEventListener('click', () => { $('depart').value = h; updateDepartOut(); });
+    tl.appendChild(div);
+  }
+}
+
+function updateDepartOut() {
+  const h = parseInt($('depart').value, 10);
+  $('departOut').textContent = h === 0 ? 'now' : `${h} h (≈${new Date(Date.now() + h * 3600000).getHours()}:00)`;
+  if (windSeries) renderWindTimeline();
+}
+$('depart').addEventListener('input', updateDepartOut);
+$('comfort').addEventListener('input', () => { if (windSeries) renderWindTimeline(); });
+
+// --- difficulty ------------------------------------------------------------
+function difficultyBadge(distKm, wsMax, maxFetchM, waterTempC) {
+  let score = 0;
+  score += distKm > 18 ? 3 : distKm > 12 ? 2 : distKm > 6 ? 1 : 0;
+  score += wsMax > 9 ? 3 : wsMax > 7 ? 2 : wsMax > 5 ? 1 : 0;
+  score += maxFetchM > 2500 ? 2 : maxFetchM > 1200 ? 1 : 0;
+  if (waterTempC != null) score += waterTempC < 8 ? 2 : waterTempC < 12 ? 1 : 0;
+  const levels = [
+    [2, 'diff-easy', 'Easy'],
+    [4, 'diff-mod', 'Moderate'],
+    [6, 'diff-hard', 'Challenging'],
+    [99, 'diff-extreme', 'Advanced'],
+  ];
+  const [, cls, label] = levels.find(([t]) => score <= t);
+  return `<span class="diffbadge ${cls}">${label}</span>`;
+}
+
+// --- rest POIs (shelters / campsites / water) ------------------------------
+let restPOIs = null;
+async function updateRestLayer() {
+  if (restLayer) { restLayer.remove(); restLayer = null; }
+  if (!$('showRest').checked || !putIn) return;
+  const r = 0.09; // ~10 km box around put-in
+  const b = [putIn.lat - r, putIn.lng - 2 * r, putIn.lat + r, putIn.lng + 2 * r];
+  try {
+    restPOIs = await fetchRestPOIs(b[0], b[1], b[2], b[3]);
+  } catch { restPOIs = []; }
+  const icon = { shelter: ['⛺', '#90be6d'], camp: ['🏕', '#90be6d'], hut: ['🛖', '#f9c74f'], water: ['🚰', '#7cc4e8'] };
+  restLayer = L.layerGroup(restPOIs.map((p) => {
+    const [emoji] = icon[p.category] || ['•', '#fff'];
+    return L.marker([p.lat, p.lon], {
+      icon: L.divIcon({ className: 'rest-icon', html: emoji, iconSize: [20, 20], iconAnchor: [10, 10] }),
+    }).bindPopup(`${p.category}${p.name ? ': ' + p.name : ''}`);
+  })).addTo(map);
+}
+
+// --- generate --------------------------------------------------------------
 async function generate() {
   if (!putIn) return;
   generateBtn.disabled = true;
@@ -199,16 +335,20 @@ async function generate() {
     const budgetSec = durationH * 3600;
     const speedMs = parseFloat($('speed').value) / 3.6;
     const comfortWs = parseFloat($('comfort').value);
+    const departH = parseInt($('depart').value, 10);
+    const departMs = Date.now() + departH * 3600 * 1000;
 
-    // Area to load: half the trip at full speed, plus margin
     const radiusM = Math.min(16000, Math.max(3000, speedMs * budgetSec * 0.5 * 1.3 + 1500));
-    const grid = makeGrid(putIn.lat, putIn.lng, radiusM);
+    const grid = makeGrid(putIn.lat, putIn.lng, radiusM, 14); // z14 for finer islets
 
     setStatus('Fetching wind forecast (SMHI)…');
-    const timelineP = fetchForecast(putIn.lat, putIn.lng, Math.ceil(durationH) + 1);
+    const seriesP = windSeries
+      ? Promise.resolve(windSeries)
+      : fetchForecastSeries(putIn.lat, putIn.lng);
     const b = gridBounds(grid);
     const spotsP = fetchLandingSpots(b[0][0], b[0][1], b[1][0], b[1][1]).catch(() => []);
-    const depthP = fetchDepthPerCell(grid, b); // null on failure, handled below
+    const depthP = fetchDepthPerCell(grid, b);
+    const marineP = fetchMarine(putIn.lat, putIn.lng);
 
     setStatus('Fetching water geometry…');
     const features = await fetchWaterFeatures(grid, (done, total) =>
@@ -217,7 +357,6 @@ async function generate() {
     setStatus('Building water grid…');
     const mask = rasterizeWater(grid, features);
 
-    // Optional hard constraints: max distance from shore, max sea depth
     const shoreDist = computeShoreDistance(mask, grid.W, grid.H, grid.cellMeters);
     const maxShoreM = parseFloat($('shore').value);
     const maxDepthM = parseFloat($('depth').value);
@@ -246,12 +385,13 @@ async function generate() {
     const reach = floodFill(waterMask, grid.W, grid.H, startIdx);
     renderMaskOverlay(grid, mask, reach);
 
-    const timeline = await timelineP;
-    showWind(timeline, durationH, comfortWs);
+    windSeries = await seriesP;
+    const timeline = sliceTimeline(windSeries, departMs, Math.ceil(durationH) + 1);
+    const marine = await marineP;
+    showConditions(timeline, departH, durationH, comfortWs, marine);
 
     setStatus('Computing wind exposure per forecast hour…');
-    await new Promise((r) => setTimeout(r, 20)); // let the UI paint
-    // Fetch field depends only on wind direction; cache by 22.5° sector
+    await new Promise((r) => setTimeout(r, 20));
     const fieldCache = new Map();
     const fetchFields = timeline.map((w) => {
       const key = Math.round(w.wdDeg / 22.5) % 16;
@@ -261,7 +401,6 @@ async function generate() {
       return fieldCache.get(key);
     });
 
-    // Landing spots -> "lunch nearby" bonus field for turn-point scoring
     const spots = await spotsP;
     const lunchBonus = new Uint8Array(grid.W * grid.H);
     const spotCells = [];
@@ -271,11 +410,10 @@ async function generate() {
       if (idx !== -1) spotCells.push({ idx, spot: s });
     }
     {
-      // Multi-source BFS: water cells within ~500 m of any landing spot
-      const depth = Math.ceil(500 / grid.cellMeters);
+      const dpt = Math.ceil(500 / grid.cellMeters);
       let frontier = spotCells.map((s) => s.idx);
       for (const i of frontier) lunchBonus[i] = 1;
-      for (let d = 0; d < depth; d++) {
+      for (let d = 0; d < dpt; d++) {
         const next = [];
         for (const i of frontier) {
           const x = i % grid.W, y = (i / grid.W) | 0;
@@ -290,7 +428,6 @@ async function generate() {
       }
     }
 
-    // Snap user stops to water reachable from the put-in
     const stopIdxs = [];
     for (let k = 0; k < stops.length; k++) {
       let idx = lonLatToCell(grid, stops[k].latlng.lng, stops[k].latlng.lat);
@@ -335,7 +472,6 @@ async function generate() {
     }
     const planMs = Math.round(performance.now() - t0);
 
-    // Smooth for display/GPX/navigation (validated against the water mask)
     const toLatLngs = (path) =>
       smoothPath(reach, grid.W, grid.H, path).map(([x, y]) => {
         const [lon, lat] = pointToLonLat(grid, x, y);
@@ -354,7 +490,6 @@ async function generate() {
       allBounds = allBounds ? allBounds.extend(line.getBounds()) : line.getBounds();
     });
 
-    // Turning point + lunch suggestion only apply to automatic round trips
     let lunch = null;
     if (turnIdx !== null) {
       const [tLon, tLat] = cellToLonLat(grid, turnIdx);
@@ -368,10 +503,8 @@ async function generate() {
         if (d < 1200 && score < bestScore) { bestScore = score; lunch = spot; }
       }
       if (lunch) {
-        const lunchMarker = L.marker([lunch.lat, lunch.lon])
-          .addTo(map)
-          .bindPopup(`🍴 Lunch stop: ${lunch.name || lunch.type}`);
-        routeLayers.push(lunchMarker);
+        routeLayers.push(L.marker([lunch.lat, lunch.lon]).addTo(map)
+          .bindPopup(`🍴 Lunch stop: ${lunch.name || lunch.type}`));
       }
     }
     map.fitBounds(allBounds, { padding: [30, 30] });
@@ -391,7 +524,7 @@ async function generate() {
       return d;
     };
     const legDists = legsLatLngs.map(legDistM);
-    const totalDistKm = legDists.reduce((a, b) => a + b, 0) / 1000;
+    const totalDistKm = legDists.reduce((a, b2) => a + b2, 0) / 1000;
     const legLabel = (k) => {
       if (stopIdxs.length === 0) return k === 0 ? 'Out' : 'Back';
       return k < stopIdxs.length ? `To stop ${k + 1}` : 'Back to put-in';
@@ -400,38 +533,61 @@ async function generate() {
       `<span style="color:${palette[k % 2]}">●</span> ${legLabel(k)}: ` +
       `${(legDists[k] / 1000).toFixed(1)} km, ${fmtTime(legTimesS[k])}`).join('<br>');
     const overBudget = stopIdxs.length > 0 && totalTimeS > 1.15 * budgetSec;
+
+    // Daylight check: will we be back before dark?
+    const sun = sunTimes(new Date(departMs), putIn.lat, putIn.lng);
+    const returnMs = departMs + totalTimeS * 1000;
+    let daylight = '';
+    if (sun) {
+      const back = new Date(returnMs);
+      const setStr = sun.sunset.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' });
+      if (returnMs > sun.sunset.getTime()) {
+        daylight = `<br><span class="warn">⚠ Returns ${back.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' })}, after sunset (${setStr}).</span>`;
+      } else {
+        const marginMin = Math.round((sun.sunset.getTime() - returnMs) / 60000);
+        daylight = `<br>Back ~${back.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' })}, ${marginMin} min before sunset (${setStr}).`;
+      }
+    }
+
     $('statsBody').innerHTML = `
       <b>Total:</b> ${totalDistKm.toFixed(1)} km, ~${fmtTime(totalTimeS)}
       ${stopIdxs.length ? ` <small style="color:#6c7f8d">(tour via ${stopIdxs.length} stop${stopIdxs.length > 1 ? 's' : ''})</small>` : ''}<br>
       ${legLines}<br>
-      ${overBudget ? `<span class="warn">⚠ Tour needs ~${fmtTime(totalTimeS)} — longer than your ${$('duration').value} h budget.</span><br>` : ''}
+      ${overBudget ? `<span class="warn">⚠ Tour needs ~${fmtTime(totalTimeS)} — longer than your ${durationH} h budget.</span><br>` : ''}
       ${lunch ? `🍴 Lunch: ${lunch.name || lunch.type} near the turning point<br>` : ''}
       Max open-water fetch: ${(maxFetchM / 1000).toFixed(1)} km<br>
       Farthest from shore: ${Math.round(maxShoreOnRoute)} m
       ${depth && maxDepthOnRoute > 0
         ? `<br>Deepest point: ~${Math.round(maxDepthOnRoute)} m
-           <small style="color:#6c7f8d">(EMODnet ~100 m grid — indicative, not for navigation)</small>`
-        : ''}
+           <small style="color:#6c7f8d">(EMODnet ~100 m grid — indicative, not for navigation)</small>` : ''}
+      ${daylight}
       ${exposed ? '<br><span class="warn">⚠ Route crosses exposed water in wind above your comfort level.</span>' : ''}
       <br><small style="color:#6c7f8d">route computed in ${planMs} ms</small>`;
+    $('difficulty').innerHTML =
+      'Difficulty: ' + difficultyBadge(totalDistKm, wsMax, maxFetchM, marine?.waterTempC);
     $('stats').classList.remove('hidden');
     $('nav').classList.remove('hidden');
+
     lastResult = {
-      legsLatLngs, lunch, totalTimeS,
+      legsLatLngs, lunch, totalTimeS, totalDistKm, departMs,
       stops: stops.map((s, k) => ({ lat: s.latlng.lat, lon: s.latlng.lng, name: `Stop ${k + 1}` })),
       isRoundTrip: stopIdxs.length === 0,
+      sunset: sun ? sun.sunset.getTime() : null,
     };
-    setStatus('Done. Drag sliders and regenerate to explore.');
+    writeUrl();
+    setStatus('Done. Caching map for offline use…');
 
     if (spotLayer) spotLayer.remove();
     spotLayer = L.layerGroup(spots.map((s) =>
       L.circleMarker([s.lat, s.lon], {
-        radius: 4,
-        color: s.type === 'slipway' ? '#90be6d' : '#f9c74f',
-        fillOpacity: 0.8,
-        weight: 1,
+        radius: 4, color: s.type === 'slipway' ? '#90be6d' : '#f9c74f',
+        fillOpacity: 0.8, weight: 1,
       }).bindPopup(`${s.type}${s.name ? ': ' + s.name : ''}`)
     )).addTo(map);
+
+    if ($('showRest').checked) updateRestLayer();
+    await prefetchTiles(allBounds);
+    setStatus('Done. Map cached for offline — drag sliders and regenerate to explore.');
   } catch (err) {
     console.error(err);
     setStatus('Error: ' + err.message);
@@ -439,23 +595,55 @@ async function generate() {
   generateBtn.disabled = false;
 }
 
-function showWind(timeline, durationH, comfortWs) {
+function showConditions(timeline, departH, durationH, comfortWs, marine) {
   const now = timeline[0];
   $('wind').classList.remove('hidden');
-  // Arrow points where the wind blows TO; base glyph ➤ points east (90°)
   $('windArrow').style.transform = `rotate(${now.wdDeg + 180 - 90}deg)`;
-  $('windText').textContent = `${now.ws.toFixed(1)} m/s from ${Math.round(now.wdDeg)}°`;
+  $('windText').textContent =
+    `${now.ws.toFixed(1)} m/s from ${Math.round(now.wdDeg)}°` +
+    (departH ? ` (at start, in ${departH} h)` : '');
   const wsMax = Math.max(...timeline.map((w) => w.ws));
   const warn = wsMax > comfortWs ? ' — above your comfort limit!' : '';
   $('windExtra').textContent =
-    `Gusts ${now.gust?.toFixed(1) ?? '?'} m/s · ${now.tempC?.toFixed(0) ?? '?'} °C · ` +
-    `peak ${wsMax.toFixed(1)} m/s during the next ${timeline.length - 1} h${warn}`;
+    `Gusts ${now.gust?.toFixed(1) ?? '?'} m/s · air ${now.tempC?.toFixed(0) ?? '?'} °C · ` +
+    `peak ${wsMax.toFixed(1)} m/s over the trip${warn}`;
+  if (marine && marine.waterTempC != null) {
+    const t = marine.waterTempC;
+    const cold = t < 12;
+    $('safety').innerHTML =
+      `Water ${t.toFixed(1)} °C` +
+      (marine.waveHeightM != null ? ` · waves ~${marine.waveHeightM.toFixed(1)} m` : '') +
+      (cold ? ` · <span class="cold">cold — dress for immersion (wetsuit/drysuit)</span>` : '');
+  } else {
+    $('safety').innerHTML = '';
+  }
 }
 
-// --- GPX export -------------------------------------------------------------
+// --- offline tile prefetch -------------------------------------------------
+async function prefetchTiles(bounds) {
+  if (!bounds || !('caches' in window)) return;
+  const note = $('offlineNote');
+  const z0 = Math.max(10, map.getZoom());
+  const urls = [];
+  for (let z = z0; z <= Math.min(16, z0 + 2); z++) {
+    const n = 2 ** z;
+    const latRad = (l) => (l * Math.PI) / 180;
+    const xT = (lon) => Math.floor(((lon + 180) / 360) * n);
+    const yT = (lat) => Math.floor((1 - Math.log(Math.tan(latRad(lat)) + 1 / Math.cos(latRad(lat))) / Math.PI) / 2 * n);
+    const sw = bounds.getSouthWest(), ne = bounds.getNorthEast();
+    for (let x = xT(sw.lng); x <= xT(ne.lng); x++)
+      for (let y = yT(ne.lat); y <= yT(sw.lat); y++)
+        urls.push(`https://tile.openstreetmap.org/${z}/${x}/${y}.png`);
+    if (urls.length > 160) break; // keep the prefetch polite (OSM tile policy)
+  }
+  let done = 0;
+  await Promise.allSettled(urls.slice(0, 160).map((u) =>
+    fetch(u, { mode: 'no-cors' }).then(() => { done++; })));
+  note.textContent = `Offline map: ${done} tiles cached for this route.`;
+}
 
-function downloadGpx() {
-  if (!lastResult) return;
+// --- GPX export ------------------------------------------------------------
+function buildGpx() {
   const esc = (s) => String(s).replace(/[<>&"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
   const pt = (tag, [lat, lon], name) =>
     `  <${tag} lat="${lat.toFixed(6)}" lon="${lon.toFixed(6)}">${name ? `<name>${esc(name)}</name>` : ''}</${tag}>`;
@@ -470,7 +658,7 @@ function downloadGpx() {
   for (const s of gpxStops) wpts.push(pt('wpt', [s.lat, s.lon], s.name));
   if (lunch) wpts.push(pt('wpt', [lunch.lat, lunch.lon], `Lunch: ${lunch.name || lunch.type}`));
   const name = isRoundTrip ? 'Round trip' : `Tour via ${gpxStops.length} stops`;
-  const gpx = `<?xml version="1.0" encoding="UTF-8"?>
+  return `<?xml version="1.0" encoding="UTF-8"?>
 <gpx version="1.1" creator="PaddlePlanner" xmlns="http://www.topografix.com/GPX/1/1">
   <metadata><name>PaddlePlanner ${name}</name><time>${new Date().toISOString()}</time></metadata>
 ${wpts.join('\n')}
@@ -478,18 +666,127 @@ ${wpts.join('\n')}
 ${legsLatLngs.map(seg).join('\n')}
   </trk>
 </gpx>`;
-  const blob = new Blob([gpx], { type: 'application/gpx+xml' });
+}
+
+function downloadGpx() {
+  if (!lastResult) return;
+  const blob = new Blob([buildGpx()], { type: 'application/gpx+xml' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = 'paddle-roundtrip.gpx';
+  a.download = 'paddle-route.gpx';
   a.click();
   URL.revokeObjectURL(a.href);
 }
 
-// --- Live GPS navigation -----------------------------------------------------
+// --- GPX import ------------------------------------------------------------
+function importGpx(text) {
+  const doc = new DOMParser().parseFromString(text, 'application/xml');
+  const num = (el, a) => parseFloat(el.getAttribute(a));
+  const wpts = [...doc.querySelectorAll('wpt')].map((w) => ({
+    lat: num(w, 'lat'), lon: num(w, 'lon'),
+    name: w.querySelector('name')?.textContent || '',
+  })).filter((p) => isFinite(p.lat));
+  const trkpts = [...doc.querySelectorAll('trkpt')].map((w) => ({ lat: num(w, 'lat'), lon: num(w, 'lon') }))
+    .filter((p) => isFinite(p.lat));
 
-const nav = { watchId: null, marker: null, accCircle: null, wakeLock: null,
-              cum: null, route: null, progress: 0 };
+  // Clear existing
+  for (const s of stops) s.marker.remove();
+  stops = [];
+  if (putInMarker) { putInMarker.remove(); putInMarker = null; }
+  putIn = null;
+  clearRoute();
+
+  const putWpt = wpts.find((p) => /put.?in/i.test(p.name)) || wpts[0] || trkpts[0];
+  if (!putWpt) { setStatus('No points found in that GPX.'); return; }
+  setPutIn([putWpt.lat, putWpt.lon], true);
+
+  const stopWpts = wpts.filter((p) => /^stop/i.test(p.name));
+  for (const s of stopWpts) addStop([s.lat, s.lon], true);
+
+  windSeries = null;
+  refreshWindPreview();
+  updateStopsUI();
+  const allPts = [[putWpt.lat, putWpt.lon], ...stopWpts.map((s) => [s.lat, s.lon]), ...trkpts.map((t) => [t.lat, t.lon])];
+  if (allPts.length) map.fitBounds(L.latLngBounds(allPts), { padding: [30, 30] });
+  setStatus(`Imported put-in${stopWpts.length ? ` + ${stopWpts.length} stop(s)` : ''}. Tap Generate to plan.`);
+}
+
+$('gpxIn').addEventListener('change', (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = () => importGpx(reader.result);
+  reader.readAsText(file);
+  e.target.value = '';
+});
+
+// --- save / share via URL --------------------------------------------------
+function writeUrl() {
+  const s = {
+    p: putIn ? [+putIn.lat.toFixed(5), +putIn.lng.toFixed(5)] : null,
+    s: stops.map((st) => [+st.latlng.lat.toFixed(5), +st.latlng.lng.toFixed(5)]),
+    d: +$('duration').value, v: +$('speed').value, c: +$('comfort').value,
+    sh: +$('shore').value, dp: +$('depth').value, dep: +$('depart').value,
+  };
+  try { history.replaceState(null, '', '#r=' + btoa(JSON.stringify(s))); } catch {}
+}
+
+function readUrl() {
+  const m = location.hash.match(/#r=(.+)/);
+  if (!m) return false;
+  let s;
+  try { s = JSON.parse(atob(m[1])); } catch { return false; }
+  if (!s || !s.p) return false;
+  const set = (id, v) => { if (v != null) { $(id).value = v; $(id).dispatchEvent(new Event('input')); } };
+  set('duration', s.d); set('speed', s.v); set('comfort', s.c);
+  set('shore', s.sh); set('depth', s.dp); set('depart', s.dep);
+  setPutIn(L.latLng(s.p[0], s.p[1]), true);
+  for (const st of s.s || []) addStop(L.latLng(st[0], st[1]), true);
+  windSeries = null;
+  refreshWindPreview();
+  updateStopsUI();
+  const pts = [s.p, ...(s.s || [])];
+  map.fitBounds(L.latLngBounds(pts), { padding: [40, 40] });
+  setStatus('Shared plan loaded — tap Generate to plan it.');
+  return true;
+}
+
+async function copyLink() {
+  writeUrl();
+  try {
+    await navigator.clipboard.writeText(location.href);
+    setStatus('Link copied to clipboard.');
+  } catch {
+    setStatus('Copy this link: ' + location.href);
+  }
+}
+
+async function shareFloatPlan() {
+  if (!lastResult) return;
+  writeUrl();
+  const back = lastResult.sunset && lastResult.departMs
+    ? new Date(lastResult.departMs + lastResult.totalTimeS * 1000)
+    : null;
+  const text =
+    `My paddling float plan:\n` +
+    `Put-in: ${putIn.lat.toFixed(4)}, ${putIn.lng.toFixed(4)}\n` +
+    `${lastResult.isRoundTrip ? 'Round trip' : lastResult.stops.length + ' stops'}, ` +
+    `${lastResult.totalDistKm.toFixed(1)} km, ~${fmtTime(lastResult.totalTimeS)}\n` +
+    (back ? `Expected back ~${back.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' })}\n` : '') +
+    `Route: ${location.href}`;
+  if (navigator.share) {
+    try { await navigator.share({ title: 'PaddlePlanner float plan', text }); return; } catch {}
+  }
+  try { await navigator.clipboard.writeText(text); setStatus('Float plan copied to clipboard.'); }
+  catch { setStatus('Float plan:\n' + text); }
+}
+
+// --- live GPS navigation ---------------------------------------------------
+const nav = {
+  watchId: null, marker: null, accCircle: null, wakeLock: null,
+  cum: null, route: null, progress: 0,
+  spokenStops: new Set(), wasOff: false, heading: null,
+};
 
 function buildNavRoute() {
   const route = lastResult.legsLatLngs.flat();
@@ -498,20 +795,16 @@ function buildNavRoute() {
   nav.route = route;
   nav.cum = cum;
   nav.progress = 0;
+  nav.spokenStops = new Set();
+  nav.wasOff = false;
 }
 
-/**
- * Project the position onto the route. On a loop, start and finish are the
- * same spot, so projection must respect progress already made: search a
- * window ahead of (and slightly behind) the current progress first, and only
- * fall back to a global search when truly lost.
- */
 function nearestOnRoute(latlng) {
   const R = 6371000, rad = Math.PI / 180;
   const cosLat = Math.cos(latlng.lat * rad);
   const toXY = ([lat, lon]) => [(lon - latlng.lng) * rad * R * cosLat, (lat - latlng.lat) * rad * R];
   const project = (lo, hi) => {
-    let best = { dist: Infinity, along: 0 };
+    let best = { dist: Infinity, along: 0, seg: 0, t: 0 };
     for (let i = 0; i < nav.route.length - 1; i++) {
       if (nav.cum[i + 1] < lo || nav.cum[i] > hi) continue;
       const [ax, ay] = toXY(nav.route[i]);
@@ -521,18 +814,28 @@ function nearestOnRoute(latlng) {
       let t = (-(ax * abx + ay * aby)) / len2;
       t = Math.max(0, Math.min(1, t));
       const d = Math.hypot(ax + t * abx, ay + t * aby);
-      if (d < best.dist) {
-        best = { dist: d, along: nav.cum[i] + t * (nav.cum[i + 1] - nav.cum[i]) };
-      }
+      if (d < best.dist) best = { dist: d, along: nav.cum[i] + t * (nav.cum[i + 1] - nav.cum[i]), seg: i, t };
     }
     return best;
   };
   let best = project(nav.progress - 400, nav.progress + 3000);
-  if (best.dist > 300) best = project(0, Infinity); // lost: global re-match
-  // Only bank progress while actually on the route; a guess made while
-  // far off route must not corrupt the remaining-distance estimate.
+  if (best.dist > 300) best = project(0, Infinity);
   if (best.dist <= 300) nav.progress = Math.max(nav.progress, best.along);
   return best;
+}
+
+function speak(text) {
+  if (!$('voice').checked || !('speechSynthesis' in window)) return;
+  try { speechSynthesis.speak(new SpeechSynthesisUtterance(text)); } catch {}
+}
+
+// Bearing in degrees from point a to b
+function bearing(a, b) {
+  const rad = Math.PI / 180;
+  const y = Math.sin((b.lng - a.lng) * rad) * Math.cos(b.lat * rad);
+  const x = Math.cos(a.lat * rad) * Math.sin(b.lat * rad) -
+    Math.sin(a.lat * rad) * Math.cos(b.lat * rad) * Math.cos((b.lng - a.lng) * rad);
+  return (Math.atan2(y, x) / rad + 360) % 360;
 }
 
 function onPosition(pos) {
@@ -553,11 +856,65 @@ function onPosition(pos) {
   const spdMs = speed && speed > 0.3 ? speed : parseFloat($('speed').value) / 3.6;
   const eta = remaining / spdMs;
   const off = p.dist > 100;
-  $('navBody').innerHTML = `
-    ${off ? '<span class="warn">⚠ Off route by ' + Math.round(p.dist) + ' m</span><br>' : ''}
-    Remaining: ${(remaining / 1000).toFixed(1)} km · ETA ${fmtTime(eta)}<br>
-    Speed: ${(spdMs * 3.6).toFixed(1)} km/h · GPS ±${Math.round(accuracy)} m`;
+
+  // Bearing to a point ~150 m ahead along the route
+  let aheadIdx = p.seg;
+  let acc = p.along;
+  while (aheadIdx < nav.route.length - 1 && acc < p.along + 150) {
+    aheadIdx++; acc = nav.cum[aheadIdx];
+  }
+  const target = nav.route[Math.min(aheadIdx, nav.route.length - 1)];
+  const brg = bearing(ll, L.latLng(target[0], target[1]));
+
+  let compassHtml = '';
+  if ($('compass').checked) {
+    const rel = nav.heading != null ? (brg - nav.heading + 360) % 360 : brg;
+    compassHtml = `<div class="compass"><span class="needle" style="transform:rotate(${rel}deg)">⬆</span></div>` +
+      `Head ${Math.round(brg)}°${nav.heading != null ? ` (turn ${Math.round(((rel + 180) % 360) - 180)}°)` : ''}<br>`;
+  }
+
+  $('navBody').innerHTML =
+    (off ? '<span class="warn">⚠ Off route by ' + Math.round(p.dist) + ' m</span><br>' : '') +
+    compassHtml +
+    `Remaining: ${(remaining / 1000).toFixed(1)} km · ETA ${fmtTime(eta)}<br>` +
+    `Speed: ${(spdMs * 3.6).toFixed(1)} km/h · GPS ±${Math.round(accuracy)} m`;
+
+  // Voice cues
+  if (off && !nav.wasOff) speak('Off route');
+  nav.wasOff = off;
+  lastResult.stops.forEach((s, k) => {
+    if (!nav.spokenStops.has(k) && havM(ll, [s.lat, s.lon]) < 150) {
+      nav.spokenStops.add(k);
+      speak(`Approaching stop ${k + 1}`);
+    }
+  });
+  if (remaining < 80 && !nav.spokenStops.has('end')) {
+    nav.spokenStops.add('end');
+    speak('Arriving back at the put-in');
+  }
 }
+
+function onHeading(e) {
+  // iOS provides webkitCompassHeading (deg from north); others use alpha
+  const h = e.webkitCompassHeading != null ? e.webkitCompassHeading
+    : (e.alpha != null ? 360 - e.alpha : null);
+  if (h != null) nav.heading = h;
+}
+
+async function enableCompass() {
+  try {
+    if (typeof DeviceOrientationEvent !== 'undefined' &&
+        typeof DeviceOrientationEvent.requestPermission === 'function') {
+      const r = await DeviceOrientationEvent.requestPermission();
+      if (r !== 'granted') { $('compass').checked = false; return; }
+    }
+    window.addEventListener('deviceorientation', onHeading, true);
+  } catch { $('compass').checked = false; }
+}
+$('compass').addEventListener('change', (e) => {
+  if (e.target.checked) enableCompass();
+  else window.removeEventListener('deviceorientation', onHeading, true);
+});
 
 async function startNav() {
   if (!lastResult) return;
@@ -566,13 +923,15 @@ async function startNav() {
     return;
   }
   buildNavRoute();
+  if ($('compass').checked) enableCompass();
   nav.watchId = navigator.geolocation.watchPosition(onPosition, (err) => {
     $('navBody').textContent = 'GPS error: ' + err.message;
   }, { enableHighAccuracy: true, maximumAge: 2000, timeout: 15000 });
-  try { nav.wakeLock = await navigator.wakeLock?.request('screen'); } catch { /* unsupported */ }
+  try { nav.wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
   $('navBtn').textContent = 'Stop navigation';
   $('navBtn').classList.add('active');
   $('navBody').textContent = 'Waiting for GPS fix…';
+  speak('Navigation started');
 }
 
 function stopNav() {
@@ -587,10 +946,44 @@ function stopNav() {
   $('navBody').textContent = '';
 }
 
+// --- install prompt --------------------------------------------------------
+let deferredPrompt = null;
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredPrompt = e;
+  $('installBtn').hidden = false;
+});
+$('installBtn').addEventListener('click', async () => {
+  if (!deferredPrompt) return;
+  deferredPrompt.prompt();
+  await deferredPrompt.userChoice;
+  deferredPrompt = null;
+  $('installBtn').hidden = true;
+});
+
+// --- online/offline indicator ----------------------------------------------
+function updateOnline() {
+  const note = $('offlineNote');
+  if (!navigator.onLine) {
+    note.textContent = 'Offline — cached maps and your last route still work.';
+    note.classList.add('offline');
+  } else {
+    note.classList.remove('offline');
+  }
+}
+window.addEventListener('online', updateOnline);
+window.addEventListener('offline', updateOnline);
+updateOnline();
+
+// --- wiring ----------------------------------------------------------------
 $('navBtn').addEventListener('click', () => (nav.watchId == null ? startNav() : stopNav()));
 $('gpxBtn').addEventListener('click', downloadGpx);
+$('shareBtn').addEventListener('click', copyLink);
+$('floatPlanBtn').addEventListener('click', shareFloatPlan);
 generateBtn.addEventListener('click', generate);
-setStatus('Click the map to set your put-in point.');
+
+if (!readUrl()) setStatus('Click the map to set your put-in point.');
+updateDepartOut();
 
 // Test hook for automated e2e verification
 window.__paddle = {
@@ -599,4 +992,6 @@ window.__paddle = {
     putIn: putIn ? { lat: putIn.lat, lng: putIn.lng } : null,
     stops: stops.map((s) => ({ lat: s.latlng.lat, lng: s.latlng.lng })),
   }),
+  buildGpx: () => (lastResult ? buildGpx() : null),
+  importGpx,
 };

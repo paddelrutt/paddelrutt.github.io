@@ -5,7 +5,8 @@ motorcyclists: *"I'm at this put-in and want to paddle for N hours — give me a
 loop that goes upwind while I'm fresh, comes home with a tailwind, and hides
 behind islands when it blows."*
 
-Fully static web app — **no backend, no API keys, no paid services.**
+Fully static web app — **no backend, no API keys, no paid services.** Installable
+as a PWA and works offline once a route is cached. Live: https://paddelrutt.github.io/
 
 ## Run it
 
@@ -16,15 +17,16 @@ npx serve -l 8420 .
 Open http://localhost:8420, click the map to set a put-in (default view is the
 Sankt Anna archipelago), set duration/speed/wind-comfort, hit **Generate**.
 
-## Data sources (all free)
+## Data sources (all free, CORS-open)
 
 | What | Source | How |
 |------|--------|-----|
-| Water geometry | [OpenFreeMap](https://openfreemap.org) vector tiles (OSM data) | `water` layer at z13, decoded in-browser, rasterized to a routing grid |
-| Wind forecast | [SMHI open data](https://opendata.smhi.se) SNOW1g point forecast | `wind_speed`, `wind_from_direction`, `wind_speed_of_gust` — no key needed |
-| Landing spots | OSM via [Overpass API](https://overpass-api.de) | slipways + beaches in the area |
+| Water geometry | [OpenFreeMap](https://openfreemap.org) vector tiles (OSM data) | `water` layer at z14, decoded in-browser, rasterized to a routing grid |
+| Wind forecast | [SMHI open data](https://opendata.smhi.se) SNOW1g point forecast | hourly `wind_speed`/`wind_from_direction`/gust — no key |
+| Sea temp + waves | [Open-Meteo Marine](https://open-meteo.com) | sea surface temperature + wave height for the safety strip |
 | Sea depth | [EMODnet Bathymetry](https://emodnet.ec.europa.eu/en/bathymetry) WCS | ~100 m GeoTIFF, decoded in-browser (geotiff.js) |
-| Base map | OpenStreetMap raster tiles | display only |
+| Landing & rest POIs | OSM via [Overpass API](https://overpass-api.de) | slipways, beaches, shelters, campsites, drinking water |
+| Base map | OpenStreetMap raster tiles | display only; pre-cached per route for offline |
 
 ## How it works
 
@@ -72,7 +74,26 @@ Sankt Anna archipelago), set duration/speed/wind-comfort, hit **Generate**.
 11. **Live GPS navigation** — Geolocation `watchPosition` with screen wake
    lock: position on the map, distance remaining, ETA, off-route warning.
    Loop-aware progress tracking (start = finish, so projection respects
-   distance already paddled). Needs HTTPS (or localhost) to get GPS.
+   distance already paddled). Optional **compass bearing** to the next point
+   ([DeviceOrientation]) and **voice cues** (approaching stops, off-route,
+   arrival). Needs HTTPS (or localhost) to get GPS.
+12. **Marker editing** — put-in and stops are draggable; tap a stop for a
+   Remove button; reorder stops with the ▲/▼ list. **GPX import** loads a
+   put-in + stops from a file to re-plan.
+13. **When to go** — a 12-hour wind timeline strip and a "start in N hours"
+   picker; the route is planned with the forecast for the chosen departure
+   (each leg uses its own elapsed-time forecast hour).
+14. **Safety strip** — sea-surface temperature with a cold-water warning,
+   wave height, a sunrise/sunset daylight check ("back X min before sunset"),
+   and a difficulty badge synthesised from distance, wind, fetch and water
+   temp.
+15. **Offline PWA** — installable to the home screen; a service worker
+   precaches the app shell and runtime-caches map tiles + libraries, and each
+   Generate pre-fetches the route's map tiles, so navigation survives losing
+   signal. Network-first for the shell so deploys still update online.
+16. **Save & share** — full plan (put-in, stops, settings) round-trips through
+   the URL hash ("Copy link"); "Share float plan" sends a route summary + ETA
+   via the Web Share API (or clipboard).
 
 ## Tests
 
@@ -90,11 +111,12 @@ node test/e2e.mjs              # live: full browser run (needs server on :8420)
   top of a few seconds of tile fetching.
 - SMHI deprecated its old PMP3g API in March 2026 — this uses the new SNOW1g
   endpoint.
-- Known limitations (fine for a spike, on the list for "real" version):
+- Known limitations (on the list for a "real" version):
   - Fetch is straight-line upwind distance; real wave height also depends on
-    duration and depth.
-  - z13 tiles drop the smallest islets; z14 would double resolution.
+    duration and depth (Open-Meteo wave height is shown but not yet used in
+    routing cost).
   - No currents/tides (minor in the Baltic, matters elsewhere).
-  - GPS navigation is "breadcrumb-style" (position vs route); no voice
-    prompts yet, and browser GPS pauses when the phone screen locks —
-    the wake lock keeps the screen on as a workaround.
+  - Compass heading depends on the device magnetometer; voice cues need the
+    screen on (the wake lock keeps it on during navigation).
+  - Tile pre-fetch is capped (~160 tiles/route) to respect OSM's tile policy;
+    very large trip areas won't fully cache.
