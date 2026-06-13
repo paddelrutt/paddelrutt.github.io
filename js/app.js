@@ -15,9 +15,10 @@ if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
 
-// Default view: Sankt Anna archipelago, a classic Swedish paddling area
-const map = L.map('map').setView([58.37, 16.78], 11);
-const baseTiles = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+// Open on an overview of Sweden; a shared link (#r=) or first map click takes over.
+const SWEDEN_BOUNDS = L.latLngBounds([[55.2, 10.8], [69.1, 24.2]]);
+const map = L.map('map').fitBounds(SWEDEN_BOUNDS);
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
   maxZoom: 19,
   attribution: '&copy; OpenStreetMap contributors',
 }).addTo(map);
@@ -211,6 +212,9 @@ $('clearAll').addEventListener('click', () => {
   clearRoute();
   updateStopsUI();
   $('wind').classList.add('hidden');
+  $('windTimeline').innerHTML = '';
+  // Drop the saved plan from the URL so a reload doesn't resurrect it
+  try { history.replaceState(null, '', location.pathname + location.search); } catch {}
   setStatus('Click the map to set your put-in point.');
 });
 
