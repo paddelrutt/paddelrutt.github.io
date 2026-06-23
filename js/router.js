@@ -30,6 +30,10 @@ const WIND_SPEED_FACTOR = 0.07;
 // still found when there is genuinely no alternative water.
 const AVOID_PENALTY = 6;
 const AVOID_RADIUS = 2;
+// "Scenery" preference: cells this far (m) or more from shore are treated as
+// fully "open water" and cost up to `sceneryW` extra, so routes hug coasts and
+// thread between islands instead of crossing open water in a straight line.
+const SCENE_REF_M = 700;
 
 /** Unit vector (grid coords, y down) for a compass bearing in degrees. */
 function bearingVec(deg) {
@@ -165,7 +169,8 @@ const bucketOf = (timeline, tSec) =>
  * opts.startTime: trip seconds already elapsed when departing startIdx
  */
 export function dijkstra(params, startIdx, opts = {}) {
-  const { mask, W, H, cellMeters, timeline, fetchFields, speedMs, comfortWs } = params;
+  const { mask, W, H, cellMeters, timeline, fetchFields, speedMs, comfortWs,
+          shoreDist, sceneryW = 0 } = params;
   const startTime = opts.startTime ?? 0;
   const N = W * H;
   const cost = new Float64Array(N).fill(Infinity);
@@ -210,6 +215,7 @@ export function dijkstra(params, startIdx, opts = {}) {
       const dist = cellMeters * len;
       const dt = dist / speeds[d];
       let penalty = 1 + 0.1 * over * (Math.min(fetchF[j], FETCH_CAP_M) / FETCH_CAP_M);
+      if (sceneryW && shoreDist) penalty += sceneryW * Math.min(shoreDist[j] / SCENE_REF_M, 1);
       if (opts.avoid && opts.avoid[j]) penalty *= AVOID_PENALTY;
       const c = cost[i] + dt * penalty;
       if (c < cost[j]) {
@@ -346,24 +352,6 @@ export function planRoundTrip(params, startIdx, budgetSec) {
     return picked.map((p) => p[2]);
   };
 
-  const evaluate = (turnIdx) => {
-    const outPath = tracePath(out.parent, turnIdx);
-    // Discourage (not forbid) reusing the outbound corridor on the way home
-    const avoid = new Uint8Array(mask.length);
-    dilateInto(avoid, W, H, outPath, AVOID_RADIUS);
-    avoid[startIdx] = 0;
-    const back = dijkstra(params, turnIdx,
-      { avoid, target: startIdx, startTime: out.time[turnIdx] });
-    if (back.time[startIdx] === Infinity) return null;
-    const total = back.time[startIdx]; // absolute trip time at return
-    const fit = Math.abs(total - budgetSec);
-    // A turn-point near a landing spot is worth being somewhat further off
-    // the requested duration: lunch on a beach beats a perfect time fit.
-    const fitAdj = fit - (lunchBonus && lunchBonus[turnIdx] ? 0.12 * budgetSec : 0);
-    return { fit, fitAdj, turnIdx, outPath, back,
-             total, outTimeS: out.time[turnIdx], backTimeS: total - out.time[turnIdx] };
-  };
-
   // The outbound target adapts to wind asymmetry: with a tailwind home the
   // return leg is faster, so the turn-point must sit further out than T/2.
   let best = null;
@@ -374,47 +362,128 @@ export function planRoundTrip(params, startIdx, budgetSec) {
     for (const turnIdx of candidatesFor(targetOut)) {
       if (tried.has(turnIdx)) continue;
       tried.add(turnIdx);
-      const r = evaluate(turnIdx);
+      const r = evaluateLoop(params, out, startIdx, turnIdx, budgetSec);
       if (r && (!iterBest || r.fitAdj < iterBest.fitAdj)) iterBest = r;
       if (r && r.total <= 1.08 * budgetSec && r.total >= 0.9 * budgetSec) { iterBest = r; break; }
     }
     if (iterBest && (!best || iterBest.fitAdj < best.fitAdj)) best = iterBest;
     if (!best) break; // no route at all from this water body
     if (best.total <= 1.08 * budgetSec && best.total >= 0.9 * budgetSec) break;
-    // Rescale the outbound target by how far off we were
     targetOut = Math.min(0.62 * budgetSec,
       Math.max(0.3 * budgetSec, targetOut * (budgetSec / best.total)));
   }
   if (!best) return null;
+  return finalizeLoop(params, out, best);
+}
 
-  const backPath = tracePath(best.back.parent, startIdx);
+// Evaluate a candidate turn-point into a full loop (out + wind-aware return
+// that avoids the outbound corridor). Shared by planRoundTrip and …Options.
+function evaluateLoop(params, out, startIdx, turnIdx, budgetSec) {
+  const { mask, W, H, lunchBonus } = params;
+  const outPath = tracePath(out.parent, turnIdx);
+  const avoid = new Uint8Array(mask.length);
+  dilateInto(avoid, W, H, outPath, AVOID_RADIUS);
+  avoid[startIdx] = 0;
+  const back = dijkstra(params, turnIdx,
+    { avoid, target: startIdx, startTime: out.time[turnIdx] });
+  if (back.time[startIdx] === Infinity) return null;
+  const total = back.time[startIdx];
+  const fit = Math.abs(total - budgetSec);
+  const fitAdj = fit - (lunchBonus && lunchBonus[turnIdx] ? 0.12 * budgetSec : 0);
+  return { fit, fitAdj, turnIdx, startIdx, outPath, back,
+           total, outTimeS: out.time[turnIdx], backTimeS: total - out.time[turnIdx] };
+}
+
+function finalizeLoop(params, out, ev) {
+  const { W, cellMeters, timeline, fetchFields } = params;
+  const backPath = tracePath(ev.back.parent, ev.startIdx);
   const distOf = (path) => {
     let d = 0;
     for (let k = 1; k < path.length; k++) {
       const a = path[k - 1], b = path[k];
       const ddx = (a % W) - (b % W), ddy = ((a / W) | 0) - ((b / W) | 0);
-      d += params.cellMeters * Math.hypot(ddx, ddy);
+      d += cellMeters * Math.hypot(ddx, ddy);
     }
     return d;
   };
   let maxFetchM = 0;
-  for (const i of best.outPath)
+  for (const i of ev.outPath)
     maxFetchM = Math.max(maxFetchM, fetchFields[bucketOf(timeline, out.time[i])][i]);
   for (const i of backPath) {
-    const t = best.back.time[i];
+    const t = ev.back.time[i];
     maxFetchM = Math.max(maxFetchM, fetchFields[bucketOf(timeline, isFinite(t) ? t : 0)][i]);
   }
-
   return {
-    outPath: best.outPath,
-    backPath,
-    turnIdx: best.turnIdx,
-    outTimeS: best.outTimeS,
-    backTimeS: best.backTimeS,
-    outDistM: distOf(best.outPath),
-    backDistM: distOf(backPath),
-    maxFetchM,
+    outPath: ev.outPath, backPath, turnIdx: ev.turnIdx,
+    outTimeS: ev.outTimeS, backTimeS: ev.backTimeS, totalTimeS: ev.total,
+    outDistM: distOf(ev.outPath), backDistM: distOf(backPath), maxFetchM,
   };
+}
+
+const angDiff = (a, b) => {
+  let d = a - b;
+  while (d > Math.PI) d -= 2 * Math.PI;
+  while (d < -Math.PI) d += 2 * Math.PI;
+  return d;
+};
+
+/**
+ * Generate up to `count` distinct round-trip options that head in genuinely
+ * different directions (so the suggestions feel like real alternatives rather
+ * than minor variants). Returns an array of route objects (finalizeLoop shape),
+ * sorted by how well each fits the time budget. Falls back to planRoundTrip.
+ */
+export function planRoundTripOptions(params, startIdx, budgetSec, count = 3) {
+  const { mask, W, timeline, fetchFields, lunchBonus } = params;
+  const out = dijkstra(params, startIdx);
+  const sx = startIdx % W, sy = (startIdx / W) | 0;
+  const target = 0.45 * budgetSec;
+  const tLo = 0.30 * budgetSec, tHi = 0.58 * budgetSec;
+  const b0 = bucketOf(timeline, target);
+  const { ws, wdDeg } = timeline[b0];
+  const [ux, uy] = bearingVec(wdDeg);
+  const windFactor = Math.min(ws / 6, 1);
+
+  // Best candidate turn-point per ~20° bearing sector around the put-in.
+  const SECTORS = 18;
+  const bySector = new Array(SECTORS).fill(null);
+  const minLen = W / 16;
+  for (let i = 0; i < mask.length; i++) {
+    const t = out.time[i];
+    if (t < tLo || t > tHi) continue;
+    const dx = (i % W) - sx, dy = ((i / W) | 0) - sy;
+    const len = Math.hypot(dx, dy);
+    if (len < minLen) continue;
+    const upwindDot = (dx * ux + dy * uy) / len;
+    const fetchF = fetchFields[bucketOf(timeline, t)];
+    const score = 1 - Math.abs(t - target) / target
+      + 0.5 * windFactor * upwindDot
+      - 0.3 * (Math.min(fetchF[i], FETCH_CAP_M) / FETCH_CAP_M)
+      + (lunchBonus && lunchBonus[i] ? 0.4 : 0);
+    const ang = Math.atan2(dy, dx);
+    const sec = (Math.floor(((ang + Math.PI) / (2 * Math.PI)) * SECTORS) % SECTORS + SECTORS) % SECTORS;
+    if (!bySector[sec] || score > bySector[sec].score) bySector[sec] = { score, i, ang };
+  }
+  const cands = bySector.filter(Boolean).sort((a, b) => b.score - a.score);
+
+  // Greedily choose turn-points at least ~45° apart, evaluating each loop.
+  const chosenAng = [];
+  const options = [];
+  for (const c of cands) {
+    if (options.length >= count) break;
+    if (chosenAng.some((a) => Math.abs(angDiff(a, c.ang)) < Math.PI / 4)) continue;
+    const ev = evaluateLoop(params, out, startIdx, c.i, budgetSec);
+    if (!ev) continue;
+    if (ev.total < 0.6 * budgetSec || ev.total > 1.45 * budgetSec) continue;
+    chosenAng.push(c.ang);
+    options.push(finalizeLoop(params, out, ev));
+  }
+  if (options.length === 0) {
+    const single = planRoundTrip(params, startIdx, budgetSec);
+    return single ? [single] : [];
+  }
+  options.sort((a, b) => Math.abs(a.totalTimeS - budgetSec) - Math.abs(b.totalTimeS - budgetSec));
+  return options;
 }
 
 // ---------------------------------------------------------------------------

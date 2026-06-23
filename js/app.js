@@ -3,7 +3,7 @@ import {
   rasterizeWater, floodFill, nearestWater,
 } from './grid.js';
 import { fetchWaterFeatures } from './tiles.js';
-import { computeFetch, computeShoreDistance, planRoundTrip, planViaRoute, smoothPath } from './router.js';
+import { computeFetch, computeShoreDistance, planRoundTripOptions, planViaRoute, smoothPath } from './router.js';
 import { fetchForecastSeries, sliceTimeline } from './smhi.js';
 import { fetchLandingSpots, fetchRestPOIs } from './overpass.js';
 import { fetchDepthPerCell } from './depth.js';
@@ -56,8 +56,11 @@ let maskOverlay = null;
 let spotLayer = null;
 let restLayer = null;
 let lastMaskCanvas = null;
-let lastResult = null;   // see generate()
+let lastResult = null;   // selected option, for GPX/nav/share
 let windSeries = null;   // cached SMHI series for the current put-in
+let routeOptions = [];   // up to 3 suggested loops (round trips)
+let routeCtx = null;     // shared context for rendering an option's stats
+let selectedOption = 0;
 
 function setStatus(msg) { statusEl.textContent = msg; }
 const havM = (a, b) => map.distance(a, b);
@@ -71,6 +74,8 @@ const bind = (id, outId, fmt) => {
 };
 bind('duration', 'durationOut', (v) => v.toFixed(1) + ' h');
 bind('speed', 'speedOut', (v) => v.toFixed(1) + ' km/h');
+bind('scenery', 'sceneryOut', (v) =>
+  v <= 0.25 ? 'direct' : v < 1 ? 'mostly direct' : v < 2.25 ? 'scenic' : 'very scenic');
 bind('comfort', 'comfortOut', (v) => v.toFixed(0) + ' m/s');
 bind('shore', 'shoreOut', (v) => (v > 2000 ? 'no limit' : v.toFixed(0) + ' m'));
 bind('depth', 'depthOut', (v) => (v > 50 ? 'no limit' : v.toFixed(0) + ' m'));
@@ -227,12 +232,17 @@ $('showMask').addEventListener('change', (e) => {
 
 $('showRest').addEventListener('change', () => updateRestLayer());
 
-function clearRoute() {
+function clearRouteLayers() {
   for (const l of routeLayers) l.remove();
   routeLayers = [];
+}
+function clearRoute() {
+  clearRouteLayers();
+  routeOptions = []; routeCtx = null;
   lastResult = null;
   $('stats').classList.add('hidden');
   $('nav').classList.add('hidden');
+  $('options').innerHTML = '';
 }
 
 function fmtTime(sec) {
@@ -460,9 +470,11 @@ async function generate() {
     const params = {
       mask: reach, W: grid.W, H: grid.H, cellMeters: grid.cellMeters,
       timeline, fetchFields, speedMs, comfortWs, lunchBonus,
+      shoreDist, sceneryW: parseFloat($('scenery').value),
     };
 
-    let legsPaths, legTimesS, totalTimeS, turnIdx = null, maxFetchM;
+    // Build raw routes: one tour for via-stops, or up to 3 round-trip options.
+    let rawRoutes;
     if (stopIdxs.length) {
       const via = planViaRoute(params, startIdx, stopIdxs);
       if (via.unreachableLeg !== undefined) {
@@ -470,19 +482,18 @@ async function generate() {
         generateBtn.disabled = false;
         return;
       }
-      ({ legs: legsPaths, legTimesS, totalTimeS, maxFetchM } = via);
+      rawRoutes = [{ legsPaths: via.legs, legTimesS: via.legTimesS, totalTimeS: via.totalTimeS, turnIdx: null, maxFetchM: via.maxFetchM }];
     } else {
-      const route = planRoundTrip(params, startIdx, budgetSec);
-      if (!route) {
+      const opts = planRoundTripOptions(params, startIdx, budgetSec, 3);
+      if (!opts.length) {
         setStatus('Could not fit a round trip here — water body may be too small for that duration.');
         generateBtn.disabled = false;
         return;
       }
-      legsPaths = [route.outPath, route.backPath];
-      legTimesS = [route.outTimeS, route.backTimeS];
-      totalTimeS = route.outTimeS + route.backTimeS;
-      turnIdx = route.turnIdx;
-      maxFetchM = route.maxFetchM;
+      rawRoutes = opts.map((o) => ({
+        legsPaths: [o.outPath, o.backPath], legTimesS: [o.outTimeS, o.backTimeS],
+        totalTimeS: o.totalTimeS, turnIdx: o.turnIdx, maxFetchM: o.maxFetchM,
+      }));
     }
     const planMs = Math.round(performance.now() - t0);
 
@@ -491,104 +502,50 @@ async function generate() {
         const [lon, lat] = pointToLonLat(grid, x, y);
         return [lat, lon];
       });
-    const legsLatLngs = legsPaths.map(toLatLngs);
-
-    const palette = ['#e76f51', '#2a9d8f'];
-    let allBounds = null;
-    legsLatLngs.forEach((ll, k) => {
-      const line = L.polyline(ll, {
-        color: palette[k % 2], weight: 4,
-        dashArray: k === legsLatLngs.length - 1 ? '8 6' : null,
-      }).addTo(map);
-      routeLayers.push(line);
-      allBounds = allBounds ? allBounds.extend(line.getBounds()) : line.getBounds();
-    });
-
-    let lunch = null;
-    if (turnIdx !== null) {
-      const [tLon, tLat] = cellToLonLat(grid, turnIdx);
-      const turnMarker = L.circleMarker([tLat, tLon], { radius: 7, color: '#f4a261', fillOpacity: 0.9 })
-        .addTo(map).bindPopup('Turning point');
-      routeLayers.push(turnMarker);
-      let bestScore = Infinity;
-      for (const { spot } of spotCells) {
-        const d = havM([tLat, tLon], [spot.lat, spot.lon]);
-        const score = d * (spot.type === 'beach' ? 1 : 1.4);
-        if (d < 1200 && score < bestScore) { bestScore = score; lunch = spot; }
-      }
-      if (lunch) {
-        routeLayers.push(L.marker([lunch.lat, lunch.lon]).addTo(map)
-          .bindPopup(`🍴 Lunch stop: ${lunch.name || lunch.type}`));
-      }
-    }
-    map.fitBounds(allBounds, { padding: [30, 30] });
-
-    const wsMax = Math.max(...timeline.slice(0, Math.ceil(totalTimeS / 3600) + 1).map((w) => w.ws));
-    const exposed = maxFetchM >= 2500 && wsMax > comfortWs;
-    let maxShoreOnRoute = 0, maxDepthOnRoute = 0;
-    for (const path of legsPaths) {
-      for (const i of path) {
-        maxShoreOnRoute = Math.max(maxShoreOnRoute, shoreDist[i]);
-        if (depth) maxDepthOnRoute = Math.max(maxDepthOnRoute, depth[i]);
-      }
-    }
     const legDistM = (ll) => {
       let d = 0;
       for (let i = 1; i < ll.length; i++) d += havM(ll[i - 1], ll[i]);
       return d;
     };
-    const legDists = legsLatLngs.map(legDistM);
-    const totalDistKm = legDists.reduce((a, b2) => a + b2, 0) / 1000;
-    const legLabel = (k) => {
-      if (stopIdxs.length === 0) return k === 0 ? 'Out' : 'Back';
-      return k < stopIdxs.length ? `To stop ${k + 1}` : 'Back to put-in';
-    };
-    const legLines = legsLatLngs.map((ll, k) =>
-      `<span style="color:${palette[k % 2]}">●</span> ${legLabel(k)}: ` +
-      `${(legDists[k] / 1000).toFixed(1)} km, ${fmtTime(legTimesS[k])}`).join('<br>');
-    const overBudget = stopIdxs.length > 0 && totalTimeS > 1.15 * budgetSec;
 
-    // Daylight check: will we be back before dark?
-    const sun = sunTimes(new Date(departMs), putIn.lat, putIn.lng);
-    const returnMs = departMs + totalTimeS * 1000;
-    let daylight = '';
-    if (sun) {
-      const back = new Date(returnMs);
-      const setStr = sun.sunset.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' });
-      if (returnMs > sun.sunset.getTime()) {
-        daylight = `<br><span class="warn">⚠ Returns ${back.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' })}, after sunset (${setStr}).</span>`;
-      } else {
-        const marginMin = Math.round((sun.sunset.getTime() - returnMs) / 60000);
-        daylight = `<br>Back ~${back.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' })}, ${marginMin} min before sunset (${setStr}).`;
+    // Turn each raw route into a renderable option with its own stats.
+    routeOptions = rawRoutes.map((r) => {
+      const legsLatLngs = r.legsPaths.map(toLatLngs);
+      const legDists = legsLatLngs.map(legDistM);
+      let maxShoreOnRoute = 0, maxDepthOnRoute = 0;
+      for (const path of r.legsPaths) for (const i of path) {
+        maxShoreOnRoute = Math.max(maxShoreOnRoute, shoreDist[i]);
+        if (depth) maxDepthOnRoute = Math.max(maxDepthOnRoute, depth[i]);
       }
-    }
+      let lunch = null, turnLatLng = null;
+      if (r.turnIdx != null) {
+        const [tLon, tLat] = cellToLonLat(grid, r.turnIdx);
+        turnLatLng = [tLat, tLon];
+        let bestScore = Infinity;
+        for (const { spot } of spotCells) {
+          const d = havM([tLat, tLon], [spot.lat, spot.lon]);
+          const sc = d * (spot.type === 'beach' ? 1 : 1.4);
+          if (d < 1200 && sc < bestScore) { bestScore = sc; lunch = spot; }
+        }
+      }
+      return {
+        legsLatLngs, legDists, legTimesS: r.legTimesS, totalTimeS: r.totalTimeS,
+        totalDistKm: legDists.reduce((a, b2) => a + b2, 0) / 1000,
+        maxFetchM: r.maxFetchM, maxShoreOnRoute, maxDepthOnRoute, turnLatLng, lunch,
+      };
+    });
 
-    $('statsBody').innerHTML = `
-      <b>Total:</b> ${totalDistKm.toFixed(1)} km, ~${fmtTime(totalTimeS)}
-      ${stopIdxs.length ? ` <small style="color:#6c7f8d">(tour via ${stopIdxs.length} stop${stopIdxs.length > 1 ? 's' : ''})</small>` : ''}<br>
-      ${legLines}<br>
-      ${overBudget ? `<span class="warn">⚠ Tour needs ~${fmtTime(totalTimeS)} — longer than your ${durationH} h budget.</span><br>` : ''}
-      ${lunch ? `🍴 Lunch: ${lunch.name || lunch.type} near the turning point<br>` : ''}
-      Max open-water fetch: ${(maxFetchM / 1000).toFixed(1)} km<br>
-      Farthest from shore: ${Math.round(maxShoreOnRoute)} m
-      ${depth && maxDepthOnRoute > 0
-        ? `<br>Deepest point: ~${Math.round(maxDepthOnRoute)} m
-           <small style="color:#6c7f8d">(EMODnet ~100 m grid — indicative, not for navigation)</small>` : ''}
-      ${daylight}
-      ${exposed ? '<br><span class="warn">⚠ Route crosses exposed water in wind above your comfort level.</span>' : ''}
-      <br><small style="color:#6c7f8d">route computed in ${planMs} ms</small>`;
-    $('difficulty').innerHTML =
-      'Difficulty: ' + difficultyBadge(totalDistKm, wsMax, maxFetchM, marine?.waterTempC);
+    routeCtx = {
+      timeline, comfortWs, durationH, budgetSec, departMs, planMs,
+      hasDepth: !!depth, marine, stopCount: stopIdxs.length,
+      putLat: putIn.lat, putLng: putIn.lng,
+      stops: stops.map((s, k) => ({ lat: s.latlng.lat, lon: s.latlng.lng, name: `Stop ${k + 1}` })),
+    };
+    selectedOption = 0;
     $('stats').classList.remove('hidden');
     $('nav').classList.remove('hidden');
+    selectRouteOption(0);
     revealRoute();
-
-    lastResult = {
-      legsLatLngs, lunch, totalTimeS, totalDistKm, departMs,
-      stops: stops.map((s, k) => ({ lat: s.latlng.lat, lon: s.latlng.lng, name: `Stop ${k + 1}` })),
-      isRoundTrip: stopIdxs.length === 0,
-      sunset: sun ? sun.sunset.getTime() : null,
-    };
     writeUrl();
     setStatus('Done. Caching map for offline use…');
 
@@ -601,13 +558,117 @@ async function generate() {
     )).addTo(map);
 
     if ($('showRest').checked) updateRestLayer();
-    await prefetchTiles(allBounds);
+    // Cache tiles covering every option so switching/offline all work.
+    let cacheBounds = null;
+    for (const o of routeOptions)
+      for (const ll of o.legsLatLngs) {
+        const lb = L.latLngBounds(ll);
+        cacheBounds = cacheBounds ? cacheBounds.extend(lb) : lb;
+      }
+    await prefetchTiles(cacheBounds);
     setStatus('Done. Map cached for offline — drag sliders and regenerate to explore.');
   } catch (err) {
     console.error(err);
     setStatus('Error: ' + err.message);
   }
   generateBtn.disabled = false;
+}
+
+const ROUTE_PALETTE = ['#e76f51', '#2a9d8f'];
+
+// Draw the selected option boldly (out solid, back dashed) and the others as
+// thin, clickable lines, then render the selected option's stats.
+function selectRouteOption(idx) {
+  selectedOption = idx;
+  clearRouteLayers();
+  routeOptions.forEach((opt, k) => {
+    if (k === idx) return;
+    const line = L.polyline(opt.legsLatLngs.flat(), { color: '#6c8aa0', weight: 3, opacity: 0.5 })
+      .addTo(map).bindTooltip(`Option ${k + 1}`);
+    line.on('click', () => selectRouteOption(k));
+    routeLayers.push(line);
+  });
+  const opt = routeOptions[idx];
+  let bounds = null;
+  opt.legsLatLngs.forEach((ll, k) => {
+    const line = L.polyline(ll, {
+      color: ROUTE_PALETTE[k % 2], weight: 4,
+      dashArray: k === opt.legsLatLngs.length - 1 ? '8 6' : null,
+    }).addTo(map);
+    routeLayers.push(line);
+    bounds = bounds ? bounds.extend(line.getBounds()) : line.getBounds();
+  });
+  if (opt.turnLatLng) {
+    routeLayers.push(L.circleMarker(opt.turnLatLng, { radius: 7, color: '#f4a261', fillOpacity: 0.9 })
+      .addTo(map).bindPopup('Turning point'));
+    if (opt.lunch) {
+      routeLayers.push(L.marker([opt.lunch.lat, opt.lunch.lon]).addTo(map)
+        .bindPopup(`🍴 Lunch stop: ${opt.lunch.name || opt.lunch.type}`));
+    }
+  }
+  if (bounds) map.fitBounds(bounds, { padding: [30, 30] });
+  renderRouteStats();
+}
+
+function renderRouteStats() {
+  const ctx = routeCtx, opt = routeOptions[selectedOption];
+
+  const sw = $('options');
+  if (routeOptions.length > 1) {
+    sw.innerHTML = routeOptions.map((o, k) =>
+      `<button class="optbtn${k === selectedOption ? ' sel' : ''}" data-i="${k}">Option ${k + 1}` +
+      `<span>${o.totalDistKm.toFixed(1)} km · ${fmtTime(o.totalTimeS)}</span></button>`).join('');
+    sw.querySelectorAll('.optbtn').forEach((btn) =>
+      btn.addEventListener('click', () => selectRouteOption(+btn.dataset.i)));
+  } else {
+    sw.innerHTML = '';
+  }
+
+  const wsMax = Math.max(...ctx.timeline.slice(0, Math.ceil(opt.totalTimeS / 3600) + 1).map((w) => w.ws));
+  const exposed = opt.maxFetchM >= 2500 && wsMax > ctx.comfortWs;
+  const legLabel = (k) => ctx.stopCount === 0
+    ? (k === 0 ? 'Out' : 'Back')
+    : (k < ctx.stopCount ? `To stop ${k + 1}` : 'Back to put-in');
+  const legLines = opt.legsLatLngs.map((ll, k) =>
+    `<span style="color:${ROUTE_PALETTE[k % 2]}">●</span> ${legLabel(k)}: ` +
+    `${(opt.legDists[k] / 1000).toFixed(1)} km, ${fmtTime(opt.legTimesS[k])}`).join('<br>');
+  const overBudget = ctx.stopCount > 0 && opt.totalTimeS > 1.15 * ctx.budgetSec;
+
+  const sun = sunTimes(new Date(ctx.departMs), ctx.putLat, ctx.putLng);
+  const returnMs = ctx.departMs + opt.totalTimeS * 1000;
+  let daylight = '';
+  if (sun) {
+    const back = new Date(returnMs);
+    const hm = (d) => d.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit' });
+    if (returnMs > sun.sunset.getTime()) {
+      daylight = `<br><span class="warn">⚠ Returns ${hm(back)}, after sunset (${hm(sun.sunset)}).</span>`;
+    } else {
+      daylight = `<br>Back ~${hm(back)}, ${Math.round((sun.sunset.getTime() - returnMs) / 60000)} min before sunset (${hm(sun.sunset)}).`;
+    }
+  }
+
+  $('statsBody').innerHTML = `
+    <b>Total:</b> ${opt.totalDistKm.toFixed(1)} km, ~${fmtTime(opt.totalTimeS)}
+    ${ctx.stopCount ? ` <small style="color:#6c7f8d">(tour via ${ctx.stopCount} stop${ctx.stopCount > 1 ? 's' : ''})</small>` : ''}<br>
+    ${legLines}<br>
+    ${overBudget ? `<span class="warn">⚠ Tour needs ~${fmtTime(opt.totalTimeS)} — longer than your ${ctx.durationH} h budget.</span><br>` : ''}
+    ${opt.lunch ? `🍴 Lunch: ${opt.lunch.name || opt.lunch.type} near the turning point<br>` : ''}
+    Max open-water fetch: ${(opt.maxFetchM / 1000).toFixed(1)} km<br>
+    Farthest from shore: ${Math.round(opt.maxShoreOnRoute)} m
+    ${ctx.hasDepth && opt.maxDepthOnRoute > 0
+      ? `<br>Deepest point: ~${Math.round(opt.maxDepthOnRoute)} m
+         <small style="color:#6c7f8d">(EMODnet ~100 m grid — indicative, not for navigation)</small>` : ''}
+    ${daylight}
+    ${exposed ? '<br><span class="warn">⚠ Route crosses exposed water in wind above your comfort level.</span>' : ''}
+    <br><small style="color:#6c7f8d">route computed in ${ctx.planMs} ms</small>`;
+  $('difficulty').innerHTML =
+    'Difficulty: ' + difficultyBadge(opt.totalDistKm, wsMax, opt.maxFetchM, ctx.marine?.waterTempC);
+
+  lastResult = {
+    legsLatLngs: opt.legsLatLngs, lunch: opt.lunch, totalTimeS: opt.totalTimeS,
+    totalDistKm: opt.totalDistKm, departMs: ctx.departMs, stops: ctx.stops,
+    isRoundTrip: ctx.stopCount === 0, sunset: sun ? sun.sunset.getTime() : null,
+  };
 }
 
 function showConditions(timeline, departH, durationH, comfortWs, marine) {
@@ -742,6 +803,7 @@ function writeUrl() {
     s: stops.map((st) => [+st.latlng.lat.toFixed(5), +st.latlng.lng.toFixed(5)]),
     d: +$('duration').value, v: +$('speed').value, c: +$('comfort').value,
     sh: +$('shore').value, dp: +$('depth').value, dep: +$('depart').value,
+    se: +$('scenery').value,
   };
   try { history.replaceState(null, '', '#r=' + btoa(JSON.stringify(s))); } catch {}
 }
@@ -754,7 +816,7 @@ function readUrl() {
   if (!s || !s.p) return false;
   const set = (id, v) => { if (v != null) { $(id).value = v; $(id).dispatchEvent(new Event('input')); } };
   set('duration', s.d); set('speed', s.v); set('comfort', s.c);
-  set('shore', s.sh); set('depth', s.dp); set('depart', s.dep);
+  set('shore', s.sh); set('depth', s.dp); set('depart', s.dep); set('scenery', s.se);
   setPutIn(L.latLng(s.p[0], s.p[1]), true);
   for (const st of s.s || []) addStop(L.latLng(st[0], st[1]), true);
   windSeries = null;

@@ -41,11 +41,17 @@ Sankt Anna archipelago), set duration/speed/wind-comfort, hit **Generate**.
 3. **Routing** (`dijkstra`) — 8-connected Dijkstra where edge time depends on
    the head/tailwind component of each travel direction, times the exposure
    penalty.
-4. **Round trip** (`planRoundTrip`) — candidate turn-points are scored for
-   upwindness (tailwind home), shelter, time fit, and lunch-spot proximity;
-   the outbound target adapts to wind asymmetry (tailwind home = turn-point
-   further out). The return leg discourages reusing the outbound corridor,
-   so you get a loop.
+4. **Round trip + 3 options** (`planRoundTrip` / `planRoundTripOptions`) —
+   candidate turn-points are scored for upwindness (tailwind home), shelter,
+   time fit, and lunch-spot proximity; the outbound target adapts to wind
+   asymmetry (tailwind home = turn-point further out). The return leg
+   discourages reusing the outbound corridor, so you get a loop. The options
+   generator picks turn-points in genuinely different directions (≥45° apart)
+   and returns up to three distinct loops to choose between.
+4c. **Scenic preference** — a "route style" slider adds a cost for being far
+   from shore (`sceneryW × min(shoreDist/700m, 1)`), so routes hug coasts and
+   thread between islands instead of crossing open water in a straight line —
+   the paddling analogue of Kurviger's curvy-roads setting.
 4b. **Via-stops tour** (`planViaRoute`) — instead of an automatic loop, click
    to drop ordered stops; the route is chained wind-aware legs
    (put-in → stop 1 → … → put-in). Each leg starts at the previous leg's

@@ -2,7 +2,7 @@
 // 6 m/s wind from SSW. Verifies fetch DP, time-varying round trips,
 // budget adherence, smoothing, and that routes stay on water.
 
-import { computeFetch, computeShoreDistance, planRoundTrip, planViaRoute, dijkstra, smoothPath } from '../js/router.js';
+import { computeFetch, computeShoreDistance, planRoundTrip, planRoundTripOptions, planViaRoute, dijkstra, smoothPath } from '../js/router.js';
 
 const W = 300, H = 300, cellMeters = 20;
 const mask = new Uint8Array(W * H);
@@ -164,6 +164,35 @@ if (via.legs) {
 // Unreachable stop (on the island) reports which leg failed
 const badVia = planViaRoute(params, startIdx, [(150 * W) + 160]);
 check('via: unreachable stop reported', badVia.unreachableLeg === 0);
+
+// --- scenery preference hugs the shore ---
+{
+  const tgt = (30 * W) + 60; // open NW water; straight path crosses open middle
+  const meanShore = (parent) => {
+    let s = 0, n = 0;
+    for (let i = tgt; i !== -1; i = parent[i]) { s += shore[i]; n++; }
+    return s / n;
+  };
+  const plain = dijkstra({ ...params, shoreDist: shore, sceneryW: 0 }, startIdx);
+  const scenic = dijkstra({ ...params, shoreDist: shore, sceneryW: 3 }, startIdx);
+  const mp = meanShore(plain.parent), ms = meanShore(scenic.parent);
+  check('scenery preference routes closer to shore', ms < mp,
+    `mean dist-from-shore ${Math.round(ms)} m scenic vs ${Math.round(mp)} m direct`);
+}
+
+// --- three distinct round-trip options ---
+{
+  const opts = planRoundTripOptions(params, startIdx, budgetSec, 3);
+  check('returns multiple route options', opts.length >= 2, `${opts.length} options`);
+  check('options have distinct turn points',
+    new Set(opts.map((o) => o.turnIdx)).size === opts.length);
+  check('every option is a complete loop on water',
+    opts.every((o) => o.outPath[0] === startIdx &&
+      o.backPath[o.backPath.length - 1] === startIdx &&
+      [...o.outPath, ...o.backPath].every((i) => mask[i] === 1)));
+  console.log('info: option totals ' +
+    opts.map((o) => (o.totalTimeS / 3600).toFixed(2) + 'h').join(', '));
+}
 
 console.log(failures === 0 ? '\nAll checks passed.' : `\n${failures} check(s) FAILED.`);
 process.exit(failures === 0 ? 0 : 1);

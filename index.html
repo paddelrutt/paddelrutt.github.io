@@ -56,6 +56,10 @@
       <input type="range" id="speed" min="3" max="7" step="0.5" value="5" />
     </label>
 
+    <label>Route style: <output id="sceneryOut">scenic</output>
+      <input type="range" id="scenery" min="0" max="3" step="0.5" value="1.5" />
+    </label>
+
     <label>Wind comfort limit: <output id="comfortOut">6 m/s</output>
       <input type="range" id="comfort" min="3" max="12" step="1" value="6" />
     </label>
@@ -92,6 +96,7 @@
 
     <div id="stats" class="card hidden">
       <h2>Route</h2>
+      <div id="options"></div>
       <div id="statsBody"></div>
       <button id="gpxBtn" class="secondary">Download GPX</button>
       <button id="floatPlanBtn" class="secondary">Share float plan</button>

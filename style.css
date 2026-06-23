@@ -33,6 +33,15 @@ body { display: flex; }
 #statsBody { font-size: 13px; line-height: 1.6; }
 #statsBody .warn { color: #f08080; }
 
+#options { display: flex; gap: 6px; margin-bottom: 10px; flex-wrap: wrap; }
+.optbtn {
+  flex: 1 1 auto; min-width: 84px; background: #24323e; color: #cfe0ec;
+  border: 0; border-radius: 6px; padding: 6px 8px; font-size: 12px; font-weight: 600;
+  cursor: pointer; text-align: center;
+}
+.optbtn.sel { background: #2a9d8f; color: #fff; }
+.optbtn span { display: block; font-size: 10px; font-weight: 400; opacity: 0.85; margin-top: 2px; }
+
 .stopsrow { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; font-size: 12px; }
 .stopsrow #stopsLabel { flex: 1 0 auto; color: #9fb3c0; }
 button.mini {
